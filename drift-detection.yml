@@ -1,0 +1,61 @@
+# Scheduled drift detection.
+#
+# The push pipeline alone is not enough. Someone with Conditional Access Administrator
+# will eventually edit a policy in the portal at 2am during an incident, and nobody
+# will remember to fold it back into the repo. This runs Plan on a schedule and fails
+# the build if the tenant no longer matches the definitions, or if unmanaged policies
+# have appeared.
+
+name: CAaC-Drift-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger: none
+pr: none
+
+schedules:
+  - cron: '0 19 * * *'          # 05:00 AEST / 06:00 AEDT
+    displayName: Daily drift check
+    branches:
+      include: [ main ]
+    always: true
+
+parameters:
+  - name: targetEnvironment
+    type: string
+    default: prod
+    values: [ nonprod, prod ]
+
+variables:
+  - name: serviceConnection
+    value: sc-entra-caac-${{ parameters.targetEnvironment }}
+  - name: caacEnvironment
+    value: ${{ parameters.targetEnvironment }}
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+  - checkout: self
+
+  - task: AzurePowerShell@5
+    displayName: Snapshot and compare
+    inputs:
+      azureSubscription: $(serviceConnection)
+      azurePowerShellVersion: LatestVersion
+      pwsh: true
+      ScriptType: InlineScript
+      Inline: |
+        Install-Module Microsoft.Graph.Authentication -Scope CurrentUser -Force
+
+        ./scripts/Export-CaBackup.ps1 `
+          -Environment '$(caacEnvironment)' `
+          -OutputPath  '$(Build.ArtifactStagingDirectory)/snapshot'
+
+        ./scripts/Invoke-CaDeploy.ps1 `
+          -Environment '$(caacEnvironment)' `
+          -Ring        Plan `
+          -FailOnChange `
+          -SummaryPath '$(Build.ArtifactStagingDirectory)/drift.json'
+
+  - publish: $(Build.ArtifactStagingDirectory)
+    artifact: ca-drift-$(caacEnvironment)
+    condition: always()

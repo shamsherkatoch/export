@@ -1,0 +1,187 @@
+# Conditional Access as Code
+#
+# Ring model:
+#   Validate    - offline Pester guardrails, runs on every PR. No tenant access.
+#   Plan        - read-only Graph diff plus a full tenant snapshot artifact.
+#   ReportOnly  - writes policies in enabledForReportingOnly. Gated by environment approval.
+#   Enforce     - promotes to metadata.targetState. Separate approval, opt-in parameter.
+#
+# The service connection must use workload identity federation. The app registration
+# behind it holds Policy.ReadWrite.ConditionalAccess and can disable every policy you
+# own, so it belongs to a protected environment with a restricted approver group.
+
+name: CAaC-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include: [ main ]
+  paths:
+    include:
+      - policies/*
+      - config/*
+      - src/*
+      - scripts/*
+
+pr:
+  branches:
+    include: [ main ]
+
+parameters:
+  - name: targetEnvironment
+    displayName: Target environment
+    type: string
+    default: nonprod
+    values: [ nonprod, prod ]
+
+  - name: promoteToEnforce
+    displayName: Promote policies from report-only to enforced
+    type: boolean
+    default: false
+
+variables:
+  - name: serviceConnection
+    value: sc-entra-caac-${{ parameters.targetEnvironment }}
+  - name: caacEnvironment
+    value: ${{ parameters.targetEnvironment }}
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+# ---------------------------------------------------------------------------
+- stage: Validate
+  displayName: Validate definitions
+  jobs:
+    - job: Guardrails
+      displayName: Offline guardrail tests
+      steps:
+        - checkout: self
+
+        - pwsh: |
+            Set-PSRepository PSGallery -InstallationPolicy Trusted
+            Install-Module Pester -MinimumVersion 5.5.0 -Scope CurrentUser -Force
+          displayName: Install Pester
+
+        - pwsh: |
+            $config = New-PesterConfiguration
+            $config.Run.Path            = './tests'
+            $config.Run.Exit            = $true
+            $config.Output.Verbosity    = 'Detailed'
+            $config.TestResult.Enabled  = $true
+            $config.TestResult.OutputPath   = '$(Agent.TempDirectory)/pester-results.xml'
+            $config.TestResult.OutputFormat = 'NUnitXml'
+            Invoke-Pester -Configuration $config
+          displayName: Run guardrail tests
+          env:
+            CAAC_ENVIRONMENT: $(caacEnvironment)
+
+        - task: PublishTestResults@2
+          condition: always()
+          inputs:
+            testResultsFormat: NUnit
+            testResultsFiles: '$(Agent.TempDirectory)/pester-results.xml'
+            testRunTitle: 'CA guardrails - $(caacEnvironment)'
+
+# ---------------------------------------------------------------------------
+- stage: Plan
+  displayName: Snapshot and plan
+  dependsOn: Validate
+  condition: succeeded()
+  jobs:
+    - job: PlanJob
+      displayName: Export tenant state and diff
+      steps:
+        - checkout: self
+
+        - task: AzurePowerShell@5
+          displayName: Snapshot current tenant policies
+          inputs:
+            azureSubscription: $(serviceConnection)
+            azurePowerShellVersion: LatestVersion
+            pwsh: true
+            ScriptType: InlineScript
+            Inline: |
+              Install-Module Microsoft.Graph.Authentication -Scope CurrentUser -Force
+              ./scripts/Export-CaBackup.ps1 `
+                -Environment '$(caacEnvironment)' `
+                -OutputPath  '$(Build.ArtifactStagingDirectory)/snapshot'
+
+        - task: AzurePowerShell@5
+          displayName: Plan change set
+          inputs:
+            azureSubscription: $(serviceConnection)
+            azurePowerShellVersion: LatestVersion
+            pwsh: true
+            ScriptType: InlineScript
+            Inline: |
+              ./scripts/Invoke-CaDeploy.ps1 `
+                -Environment '$(caacEnvironment)' `
+                -Ring        Plan `
+                -SummaryPath '$(Build.ArtifactStagingDirectory)/plan.json'
+
+        - publish: $(Build.ArtifactStagingDirectory)
+          artifact: ca-plan-$(caacEnvironment)
+          displayName: Publish snapshot and plan
+
+# ---------------------------------------------------------------------------
+- stage: ReportOnly
+  displayName: Deploy (report-only)
+  dependsOn: Plan
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+    - deployment: DeployReportOnly
+      environment: entra-ca-$(caacEnvironment)-reportonly
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - checkout: self
+
+              - task: AzurePowerShell@5
+                displayName: Apply in report-only
+                inputs:
+                  azureSubscription: $(serviceConnection)
+                  azurePowerShellVersion: LatestVersion
+                  pwsh: true
+                  ScriptType: InlineScript
+                  Inline: |
+                    Install-Module Microsoft.Graph.Authentication -Scope CurrentUser -Force
+                    ./scripts/Invoke-CaDeploy.ps1 `
+                      -Environment '$(caacEnvironment)' `
+                      -Ring        ReportOnly `
+                      -SummaryPath '$(Build.ArtifactStagingDirectory)/reportonly-result.json'
+
+              - publish: $(Build.ArtifactStagingDirectory)
+                artifact: ca-reportonly-$(caacEnvironment)
+
+# ---------------------------------------------------------------------------
+- stage: Enforce
+  displayName: Promote to enforced
+  dependsOn: ReportOnly
+  condition: and(succeeded(), ${{ eq(parameters.promoteToEnforce, true) }})
+  jobs:
+    - deployment: DeployEnforce
+      environment: entra-ca-$(caacEnvironment)-enforced
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - checkout: self
+
+              - task: AzurePowerShell@5
+                displayName: Apply target state
+                inputs:
+                  azureSubscription: $(serviceConnection)
+                  azurePowerShellVersion: LatestVersion
+                  pwsh: true
+                  ScriptType: InlineScript
+                  Inline: |
+                    Install-Module Microsoft.Graph.Authentication -Scope CurrentUser -Force
+                    ./scripts/Invoke-CaDeploy.ps1 `
+                      -Environment '$(caacEnvironment)' `
+                      -Ring        Enforce `
+                      -SummaryPath '$(Build.ArtifactStagingDirectory)/enforce-result.json'
+
+              - publish: $(Build.ArtifactStagingDirectory)
+                artifact: ca-enforce-$(caacEnvironment)

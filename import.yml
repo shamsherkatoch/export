@@ -1,0 +1,85 @@
+# Adoption pipeline. Manual trigger, read-only against both tenants.
+#
+# Imports the live Conditional Access policies from NonProd and Prod, tokenises the
+# directory references, reconciles the two sets, and publishes the drafts plus a
+# reconciliation report as artifacts. Nothing is written to either tenant, and
+# nothing is committed. A human reviews the artifact and raises the PR.
+
+name: CAaC-Import-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger: none
+pr: none
+
+parameters:
+  - name: owner
+    displayName: Owner mailbox to stamp on imported definitions
+    type: string
+    default: identity-platform@contoso.com
+
+  - name: displayNameFilter
+    displayName: Optional display name filter (wildcards, comma separated)
+    type: string
+    default: '*'
+
+  - name: idPrefix
+    displayName: ID prefix for policies with no existing CAnnn identifier
+    type: string
+    default: IMP
+
+pool:
+  vmImage: ubuntu-latest
+
+jobs:
+  - job: Import
+    displayName: Import both tenants and reconcile
+    steps:
+      - checkout: self
+
+      - task: AzurePowerShell@5
+        displayName: Import Prod
+        inputs:
+          azureSubscription: sc-entra-caac-prod
+          azurePowerShellVersion: LatestVersion
+          pwsh: true
+          ScriptType: InlineScript
+          Inline: |
+            Install-Module Microsoft.Graph.Authentication -Scope CurrentUser -Force
+            $filter = '${{ parameters.displayNameFilter }}' -split ',' | ForEach-Object { $_.Trim() }
+            ./scripts/Import-CaPolicy.ps1 `
+              -Environment prod `
+              -OutputPath  '$(Build.ArtifactStagingDirectory)/import/prod' `
+              -Owner       '${{ parameters.owner }}' `
+              -IdPrefix    '${{ parameters.idPrefix }}' `
+              -DisplayNameFilter $filter `
+              -SummaryPath '$(Build.ArtifactStagingDirectory)/import/prod-summary.json'
+
+      - task: AzurePowerShell@5
+        displayName: Import NonProd
+        inputs:
+          azureSubscription: sc-entra-caac-nonprod
+          azurePowerShellVersion: LatestVersion
+          pwsh: true
+          ScriptType: InlineScript
+          Inline: |
+            $filter = '${{ parameters.displayNameFilter }}' -split ',' | ForEach-Object { $_.Trim() }
+            ./scripts/Import-CaPolicy.ps1 `
+              -Environment nonprod `
+              -OutputPath  '$(Build.ArtifactStagingDirectory)/import/nonprod' `
+              -Owner       '${{ parameters.owner }}' `
+              -IdPrefix    '${{ parameters.idPrefix }}' `
+              -DisplayNameFilter $filter `
+              -SummaryPath '$(Build.ArtifactStagingDirectory)/import/nonprod-summary.json'
+
+      - pwsh: |
+          ./scripts/Compare-CaImport.ps1 `
+            -BaselinePath '$(Build.ArtifactStagingDirectory)/import/prod' `
+            -OverlayPath  '$(Build.ArtifactStagingDirectory)/import/nonprod' `
+            -BaselineEnv  prod `
+            -OverlayEnv   nonprod `
+            -ReportPath   '$(Build.ArtifactStagingDirectory)/import/reconciliation.md' `
+            -SummaryPath  '$(Build.ArtifactStagingDirectory)/import/reconciliation.json'
+        displayName: Reconcile Prod against NonProd
+
+      - publish: $(Build.ArtifactStagingDirectory)/import
+        artifact: ca-import-drafts
+        displayName: Publish drafts and reconciliation report

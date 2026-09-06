@@ -1,0 +1,15 @@
+{
+  "name": "prod",
+  "tenantId": "00000000-0000-0000-0000-000000000000",
+  "description": "Production Entra tenant.",
+
+  "aliases": {
+    "group:BreakGlass": "SG-EntraID-BreakGlass-Accounts",
+    "group:CA-Exclusions-Global": "SG-CA-Exclusion-Global-Prod"
+  },
+
+  "guardrails": {
+    "requiredExclusionGroups": [ "group:BreakGlass" ],
+    "namingPattern": "^CA\\d{3} - .+ - v\\d+\\.\\d+$"
+  }
+}

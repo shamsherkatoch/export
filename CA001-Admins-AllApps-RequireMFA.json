@@ -1,0 +1,53 @@
+{
+  "metadata": {
+    "id": "CA001",
+    "description": "Requires multifactor authentication for any user holding a privileged directory role, across all cloud apps. Highest value / lowest blast radius policy, so it goes first.",
+    "owner": "identity-platform@contoso.com",
+    "targetState": "enabled",
+    "changeRequest": "CHG0001234",
+    "reviewedUtc": "2026-09-05"
+  },
+  "policy": {
+    "displayName": "CA001 - Admins - All apps - Require MFA - v1.0",
+    "conditions": {
+      "users": {
+        "includeUsers": [],
+        "excludeUsers": [],
+        "includeGroups": [],
+        "excludeGroups": [
+          "{{group:BreakGlass}}",
+          "{{group:CA-Exclusions-Global}}"
+        ],
+        "includeRoles": [
+          "{{role:Global Administrator}}",
+          "{{role:Privileged Role Administrator}}",
+          "{{role:Privileged Authentication Administrator}}",
+          "{{role:Conditional Access Administrator}}",
+          "{{role:Security Administrator}}",
+          "{{role:Application Administrator}}",
+          "{{role:Cloud Application Administrator}}",
+          "{{role:Authentication Administrator}}",
+          "{{role:User Administrator}}",
+          "{{role:Helpdesk Administrator}}",
+          "{{role:Password Administrator}}",
+          "{{role:Billing Administrator}}",
+          "{{role:Exchange Administrator}}",
+          "{{role:SharePoint Administrator}}"
+        ],
+        "excludeRoles": []
+      },
+      "applications": {
+        "includeApplications": [ "All" ],
+        "excludeApplications": []
+      },
+      "clientAppTypes": [ "all" ]
+    },
+    "grantControls": {
+      "operator": "OR",
+      "builtInControls": [],
+      "authenticationStrength": {
+        "id": "{{authStrength:Multifactor authentication}}"
+      }
+    }
+  }
+}
