@@ -1,0 +1,7 @@
+bin
+obj
+.vs
+.vscode
+local.settings.json
+*.user
+node_modules

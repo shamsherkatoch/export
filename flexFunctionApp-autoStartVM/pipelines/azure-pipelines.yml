@@ -1,0 +1,193 @@
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - functionApp-autoStartVM/*
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - functionApp-autoStartVM/*
+
+parameters:
+  - name: environment
+    displayName: Target environment
+    type: string
+    default: dev
+    values:
+      - dev
+      - tst
+      - prd
+
+variables:
+  - name: workingDir
+    value: $(Build.SourcesDirectory)/functionApp-autoStartVM
+  - name: bicepFile
+    value: $(workingDir)/infra/main.bicep
+  - name: bicepParams
+    value: $(workingDir)/infra/main.bicepparam
+  - name: functionSrc
+    value: $(workingDir)/src
+  - name: vmListFile
+    value: $(workingDir)/config/vmList.json
+  - name: azureServiceConnection
+    value: sc-azure-${{ parameters.environment }}
+  - name: resourceGroupName
+    value: rg-autostartvm-${{ parameters.environment }}
+  - name: location
+    value: eastus
+
+stages:
+  - stage: Validate
+    displayName: Validate Bicep
+    jobs:
+      - job: Lint
+        displayName: Bicep lint & what-if
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: bicep build
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                az bicep upgrade
+                az bicep build --file "$(bicepFile)"
+
+          - task: AzureCLI@2
+            displayName: what-if
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                az group create --name "$(resourceGroupName)" --location "$(location)" --only-show-errors 1>/dev/null
+                az deployment group what-if \
+                  --resource-group "$(resourceGroupName)" \
+                  --parameters "$(bicepParams)" \
+                  --parameters environment=${{ parameters.environment }}
+
+  - stage: Deploy
+    displayName: Deploy infra & function
+    dependsOn: Validate
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: DeployInfra
+        displayName: Bicep + code deployment
+        environment: ${{ parameters.environment }}
+        pool:
+          vmImage: ubuntu-latest
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureCLI@2
+                  displayName: Deploy Bicep
+                  name: bicepDeploy
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      az group create --name "$(resourceGroupName)" --location "$(location)" --only-show-errors 1>/dev/null
+
+                      deploymentName="autostartvm-$(Build.BuildId)"
+                      az deployment group create \
+                        --name "$deploymentName" \
+                        --resource-group "$(resourceGroupName)" \
+                        --parameters "$(bicepParams)" \
+                        --parameters environment=${{ parameters.environment }}
+
+                      functionAppName=$(az deployment group show \
+                        --name "$deploymentName" \
+                        --resource-group "$(resourceGroupName)" \
+                        --query properties.outputs.functionAppName.value -o tsv)
+                      storageAccountName=$(az deployment group show \
+                        --name "$deploymentName" \
+                        --resource-group "$(resourceGroupName)" \
+                        --query properties.outputs.storageAccountName.value -o tsv)
+                      configContainer=$(az deployment group show \
+                        --name "$deploymentName" \
+                        --resource-group "$(resourceGroupName)" \
+                        --query properties.outputs.configContainerName.value -o tsv)
+                      vmListBlob=$(az deployment group show \
+                        --name "$deploymentName" \
+                        --resource-group "$(resourceGroupName)" \
+                        --query properties.outputs.vmListBlobName.value -o tsv)
+
+                      echo "##vso[task.setvariable variable=functionAppName;isOutput=true]$functionAppName"
+                      echo "##vso[task.setvariable variable=storageAccountName;isOutput=true]$storageAccountName"
+                      echo "##vso[task.setvariable variable=configContainer;isOutput=true]$configContainer"
+                      echo "##vso[task.setvariable variable=vmListBlob;isOutput=true]$vmListBlob"
+
+                - task: AzureCLI@2
+                  displayName: Upload VM list to blob
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      src="$(vmListFile)"
+                      if [ ! -f "$src" ]; then
+                        echo "vmList.json not found at $src — falling back to sample."
+                        src="$(workingDir)/config/vmList.sample.json"
+                      fi
+                      az storage blob upload \
+                        --account-name "$(bicepDeploy.storageAccountName)" \
+                        --auth-mode login \
+                        --container-name "$(bicepDeploy.configContainer)" \
+                        --name "$(bicepDeploy.vmListBlob)" \
+                        --file "$src" \
+                        --overwrite true
+
+                - task: UsePythonVersion@0
+                  inputs:
+                    versionSpec: '3.11'
+                    addToPath: true
+                  displayName: Use Python (for Azure Functions Core Tools)
+
+                - script: |
+                    set -euo pipefail
+                    curl -fsSL https://packages.microsoft.com/config/ubuntu/22.04/packages-microsoft-prod.deb -o packages-microsoft-prod.deb
+                    sudo dpkg -i packages-microsoft-prod.deb
+                    sudo apt-get update
+                    sudo apt-get install -y azure-functions-core-tools-4
+                  displayName: Install Azure Functions Core Tools v4
+
+                - task: ArchiveFiles@2
+                  displayName: Package function app
+                  inputs:
+                    rootFolderOrFile: $(functionSrc)
+                    includeRootFolder: false
+                    archiveType: zip
+                    archiveFile: $(Build.ArtifactStagingDirectory)/functionapp.zip
+                    replaceExistingArchive: true
+
+                - task: AzureCLI@2
+                  displayName: Publish to Flex Consumption
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      az functionapp deployment source config-zip \
+                        --resource-group "$(resourceGroupName)" \
+                        --name "$(bicepDeploy.functionAppName)" \
+                        --src "$(Build.ArtifactStagingDirectory)/functionapp.zip" \
+                        --build-remote false

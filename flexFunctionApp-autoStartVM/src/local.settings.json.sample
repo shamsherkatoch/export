@@ -1,0 +1,16 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "powershell",
+    "FUNCTIONS_WORKER_RUNTIME_VERSION": "7.4",
+    "UAMI_CLIENT_ID": "<uami-client-id>",
+    "STORAGE_ACCOUNT_NAME": "<storage-account>",
+    "STORAGE_BLOB_ENDPOINT": "https://<storage-account>.blob.core.windows.net/",
+    "VMLIST_CONTAINER": "config",
+    "VMLIST_BLOB": "vmList.json",
+    "TARGET_SUBSCRIPTION_ID": "<subscription-id>",
+    "TARGET_RESOURCE_GROUPS": "rg-workloads-dev",
+    "START_VMS_SCHEDULE": "0 0 7 * * 1-5"
+  }
+}

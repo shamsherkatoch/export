@@ -1,0 +1,17 @@
+{
+  "vms": [
+    {
+      "subscriptionId": "00000000-0000-0000-0000-000000000000",
+      "resourceGroupName": "rg-workloads-dev",
+      "vmName": "vm-web-01"
+    },
+    {
+      "resourceGroupName": "rg-workloads-dev",
+      "vmName": "vm-app-01"
+    },
+    {
+      "resourceGroupName": "rg-workloads-dev",
+      "vmName": "vm-app-02"
+    }
+  ]
+}

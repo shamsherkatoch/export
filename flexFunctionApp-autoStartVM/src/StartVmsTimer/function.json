@@ -1,0 +1,12 @@
+{
+  "bindings": [
+    {
+      "name": "Timer",
+      "type": "timerTrigger",
+      "direction": "in",
+      "schedule": "%START_VMS_SCHEDULE%",
+      "runOnStartup": false,
+      "useMonitor": true
+    }
+  ]
+}
