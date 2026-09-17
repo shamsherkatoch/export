@@ -61,7 +61,7 @@ Parameters (set at queue time):
 
 - `whatIf` (bool, default `true`) — passed to the script as `-WhatIfMode`. Scheduled runs use the default, so the schedule is dry-run unless the pipeline default is flipped. To perform writes, queue the pipeline manually with `whatIf = false`.
 
-Variable group `finops-tag-reconciliation` (non-secret; all required):
+Pipeline variables defined directly on the pipeline (**Pipeline → Edit → Variables** in the ADO UI). Not a variable group and not a YAML `variables:` block. All non-secret, all required:
 
 - `serviceConnectionName` — ADO service connection backed by the UAMI (federated).
 - `sharePointHostname` — e.g. `contoso.sharepoint.com`.
@@ -93,6 +93,12 @@ Variable group `finops-tag-reconciliation` (non-secret; all required):
 
 Newest first. One entry per change. Format: `YYYY-MM-DD — <short summary>`, followed by a short bullet list of what changed and why.
 
+- 2026-09-17 — Added placeholder pipeline variables inline.
+  - `pipelines/azure-pipelines.yml` now defines `serviceConnectionName`, `sharePointHostname`, `sharePointSitePath`, `csvItemPath`, and `managementGroupId` under `variables:` with `dummy-*` values so the YAML validates on its own.
+  - These are placeholders only — the pipeline's own **Variables** section (ADO UI) is expected to override each before the first real run. Do not commit real values here; the YAML defaults are for scaffolding, not for production.
+- 2026-09-17 — Dropped variable group; config lives on the pipeline itself.
+  - Removed `- group: finops-tag-reconciliation` from `pipelines/azure-pipelines.yml`. The five settings (`serviceConnectionName`, `sharePointHostname`, `sharePointSitePath`, `csvItemPath`, `managementGroupId`) are now defined in the ADO pipeline's own Variables section.
+  - Updated the README and this spec to describe the new setup path.
 - 2026-09-17 — Rewrote `claude.md` to reflect the shipped solution.
   - Replaced the "greenfield" placeholder with a description of the actual pipeline and PowerShell script, including CSV contract, pagination, verification, and pipeline parameter/variable-group shape.
   - Added this Change log section and the convention that all future changes get recorded here.

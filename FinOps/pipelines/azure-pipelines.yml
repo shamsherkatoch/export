@@ -19,13 +19,11 @@ parameters:
     default: true
 
 variables:
-  # Non-secret config. Set these on the variable group or as pipeline variables.
-  #   serviceConnectionName   ADO service connection backed by the UAMI (federated)
-  #   sharePointHostname      e.g. contoso.sharepoint.com
-  #   sharePointSitePath      e.g. /sites/finops
-  #   csvItemPath             drive-root-relative, e.g. Shared Documents/finops/tags.csv
-  #   managementGroupId       target management group name (not display name)
-  - group: finops-tag-reconciliation
+  serviceConnectionName: dummy-finops-uami-federated
+  sharePointHostname: dmycloudgurucom.sharepoint.com
+  sharePointSitePath: /sites/dummy-finops
+  csvItemPath: Shared Documents/dummy-finops/tags.csv
+  managementGroupId: dummy-mg-id
 
 pool:
   vmImage: windows-latest

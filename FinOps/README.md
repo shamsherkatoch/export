@@ -38,9 +38,9 @@ FinOps/
 
 ## Prerequisites
 
-### 1. Variable group `finops-tag-reconciliation`
+### 1. Pipeline variables
 
-Create it in the pipeline's project under **Pipelines → Library** with these variables (none are secrets):
+Define these directly on the pipeline (**Pipelines → select the pipeline → Edit → Variables**). No variable group and no YAML `variables:` block — all values are held in the pipeline's own Variables section. None are secrets; leave the "Keep this value secret" checkbox off unless your org policy requires otherwise.
 
 | Variable | Example | Purpose |
 | --- | --- | --- |
@@ -50,7 +50,7 @@ Create it in the pipeline's project under **Pipelines → Library** with these v
 | `csvItemPath` | `Shared Documents/finops/tags.csv` | Drive-root-relative path to the CSV. |
 | `managementGroupId` | `mg-contoso-root` | Management group **name** (not display name). |
 
-Link this variable group to the pipeline (already referenced via `- group: finops-tag-reconciliation`).
+The pipeline YAML references each as `$(name)` and expects them to resolve at queue time — a missing variable fails the run at the `AzurePowerShell@5` step with an empty-argument error.
 
 ### 2. UAMI and federated service connection
 
