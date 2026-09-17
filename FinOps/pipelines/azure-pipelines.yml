@@ -19,11 +19,11 @@ parameters:
     default: true
 
 variables:
-  serviceConnectionName: dummy-finops-uami-federated
-  sharePointHostname: dmycloudgurucom.sharepoint.com
-  sharePointSitePath: /sites/dummy-finops
-  csvItemPath: Shared Documents/dummy-finops/tags.csv
-  managementGroupId: dummy-mg-id
+  serviceConnectionName: "sc-finops-tags"
+  sharePointHostname: "mycloudgurucom.sharepoint.com"
+  sharePointSitePath: "/sites/mycloudguru"
+  csvItemPath: "/Shared%20Documents/poc/tags.csv"
+  managementGroupId: "MCGAU"
 
 pool:
   vmImage: windows-latest
