@@ -1,0 +1,54 @@
+# Reconcile Azure RG tags from a SharePoint CSV.
+# Auth: UAMI + workload-identity federated service connection (no secrets).
+
+trigger: none
+pr: none
+
+schedules:
+  - cron: "0 6 * * *"
+    displayName: Daily tag reconciliation (06:00 UTC)
+    branches:
+      include:
+        - main
+    always: true
+
+parameters:
+  - name: whatIf
+    displayName: Dry run (report only, no writes)
+    type: boolean
+    default: true
+
+variables:
+  # Non-secret config. Set these on the variable group or as pipeline variables.
+  #   serviceConnectionName   ADO service connection backed by the UAMI (federated)
+  #   sharePointHostname      e.g. contoso.sharepoint.com
+  #   sharePointSitePath      e.g. /sites/finops
+  #   csvItemPath             drive-root-relative, e.g. Shared Documents/finops/tags.csv
+  #   managementGroupId       target management group name (not display name)
+  - group: finops-tag-reconciliation
+
+pool:
+  vmImage: windows-latest
+
+jobs:
+  - job: reconcile
+    displayName: Reconcile RG tags
+    timeoutInMinutes: 60
+    steps:
+      - checkout: self
+
+      - task: AzurePowerShell@5
+        displayName: Invoke-TagReconciliation.ps1
+        inputs:
+          azureSubscription: $(serviceConnectionName)
+          scriptType: FilePath
+          scriptPath: scripts/Invoke-TagReconciliation.ps1
+          scriptArguments: >-
+            -SharePointHostname "$(sharePointHostname)"
+            -SharePointSitePath "$(sharePointSitePath)"
+            -CsvItemPath "$(csvItemPath)"
+            -ManagementGroupId "$(managementGroupId)"
+            -WhatIfMode ${{ parameters.whatIf }}
+          azurePowerShellVersion: LatestVersion
+          pwsh: true
+          failOnStandardError: true
