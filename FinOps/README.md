@@ -93,20 +93,117 @@ New-AzRoleAssignment -ObjectId $uamiObjId -RoleDefinitionName "Tag Contributor" 
 
 #### 3b. Microsoft Graph → SharePoint (CSV read)
 
-- Grant the UAMI's app the **`Sites.Selected`** application permission on Microsoft Graph and admin-consent it.
-- Grant the app `read` on the specific site (not the whole tenant) via Graph:
+The UAMI needs Graph permission to download the CSV. The pipeline uses **`Sites.Selected`** (application permission), which grants access to **only** the specific SharePoint site you scope it to — not every site in the tenant. There are two grants to do, in order:
 
-  ```
-  POST https://graph.microsoft.com/v1.0/sites/{siteId}/permissions
-  {
-    "roles": ["read"],
-    "grantedToIdentities": [
-      { "application": { "id": "<UAMI clientId>", "displayName": "<UAMI name>" } }
-    ]
-  }
-  ```
+1. **Tenant-level**: give the UAMI's service principal the `Sites.Selected` app permission on Microsoft Graph, and admin-consent it. This unlocks the *ability* to be granted per-site access, but on its own confers zero site access.
+2. **Site-level**: grant the UAMI `read` on the one SharePoint site that holds the CSV, via `POST /sites/{siteId}/permissions`. Only after this step will the pipeline be able to fetch the file.
 
-- `read` is sufficient — the script only downloads the file, it never writes back.
+`read` is sufficient — the script only downloads the file, it never writes back. Use `write` only if a future workload updates the CSV from Azure.
+
+##### Values you need before you start
+
+Collect these once and reuse them. All lookups use PowerShell: `Az.ManagedServiceIdentity` for the UAMI and `Microsoft.Graph.Applications` for Graph. Install once with:
+
+```powershell
+Install-Module Az.ManagedServiceIdentity, Microsoft.Graph.Applications, Microsoft.Graph.Sites -Scope CurrentUser
+```
+
+| Value | Where to find it |
+| --- | --- |
+| **UAMI `clientId`** (aka `appId`) | Azure Portal → the Managed Identity → Overview → **Client ID**. Also `(Get-AzUserAssignedIdentity -Name <uami> -ResourceGroupName <rg>).ClientId`. |
+| **UAMI `objectId`** (service principal id in Entra) | Azure Portal → the Managed Identity → Overview → **Object (principal) ID**. Also `(Get-AzUserAssignedIdentity -Name <uami> -ResourceGroupName <rg>).PrincipalId`. |
+| **UAMI display name** | The Managed Identity's name — used only as a label in the Graph permissions payload. |
+| **Microsoft Graph service principal `objectId`** in your tenant | `(Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'").Id` (the `00000003-…` app id is Microsoft Graph, the same in every tenant; the service principal's object id is per-tenant). |
+| **`Sites.Selected` app-role id** | `9492366f-7969-46a4-8d15-ed1a20078fff` — same in every tenant, no need to look it up. |
+| **`siteId`** for the SharePoint site | Resolve via Graph — see step 2 below. Format is `{host},{siteCollectionGuid},{siteGuid}`. |
+
+You'll need a signed-in admin (either an Entra admin who can grant app-role assignments and admin-consent Graph permissions, or a SharePoint admin / site owner who can grant site permissions — usually the same person can do both). The pipeline's UAMI cannot grant these permissions to itself; a human runs this once.
+
+Sign in once at the top of the session and reuse the connection for every step below:
+
+```powershell
+Connect-AzAccount                              # for Az.ManagedServiceIdentity lookups
+Connect-MgGraph -Scopes `
+  "AppRoleAssignment.ReadWrite.All", `
+  "Application.Read.All", `
+  "Sites.FullControl.All"                      # required to POST /sites/{id}/permissions
+```
+
+##### Step 1 — Grant `Sites.Selected` at the tenant and admin-consent it
+
+Assigns the Graph `Sites.Selected` app role to the UAMI's service principal. Do this once per UAMI.
+
+```powershell
+$uamiObjectId      = "e1856993-f28d-4298-9e07-3aec23b77e4a"   # principalId of the managed identity
+$graphSp           = Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'"
+$sitesSelectedRole = $graphSp.AppRoles | Where-Object { $_.Value -eq "Sites.Selected" }
+
+New-MgServicePrincipalAppRoleAssignment `
+  -ServicePrincipalId $uamiObjectId `
+  -PrincipalId        $uamiObjectId `
+  -ResourceId         $graphSp.Id `
+  -AppRoleId          $sitesSelectedRole.Id
+```
+
+A successful call returns an `appRoleAssignment` object. Because you granted an *application* permission directly to a service principal, this **is** the admin consent — there is no separate "Grant admin consent" click for managed identities.
+
+**Verify**: the assignment should show up under **Entra ID → Enterprise applications → (the UAMI) → Permissions**, listing `Sites.Selected` on `Microsoft Graph` as admin-consented. Or from PowerShell:
+
+```powershell
+Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $uamiObjectId |
+  Where-Object { $_.ResourceId -eq $graphSp.Id } |
+  Select-Object PrincipalDisplayName, AppRoleId, ResourceDisplayName
+```
+
+##### Step 2 — Resolve the `siteId` of the target SharePoint site
+
+Every site-level grant needs the site's Graph id. Do this once per site (any Graph-permitted admin identity can call it — you're not using the UAMI yet):
+
+```powershell
+$sharePointHostname = "mycloudgurucom.sharepoint.com"
+$sharePointSitePath = "/sites/mycloudguru"
+
+$site   = Invoke-MgGraphRequest -Method GET `
+  -Uri "https://graph.microsoft.com/v1.0/sites/${sharePointHostname}:${sharePointSitePath}"
+$siteId = $site.id
+$siteId
+# returns: mycloudgurucom.sharepoint.com,3f2504e0-4f89-11d3-9a0c-0305e82c3301,a1b2c3d4-...
+```
+
+The pipeline script does the same lookup at runtime, so the UAMI itself doesn't need this value stored anywhere — it's only used in step 3.
+
+##### Step 3 — Grant the UAMI `read` on that one site
+
+`POST /sites/{siteId}/permissions` gives the UAMI's application the actual per-site access. Without this, `Sites.Selected` alone still returns `403` on every site.
+
+```powershell
+$uamiClientId = "183dd23f-4b9e-4d8c-abc8-8c184c7a3f44"
+$uamiName     = "uami-finops-tags"
+
+$body = @{
+  roles               = @("read")
+  grantedToIdentities = @(
+    @{ application = @{ id = $uamiClientId; displayName = $uamiName } }
+  )
+} | ConvertTo-Json -Depth 5
+
+$grant = Invoke-MgGraphRequest -Method POST `
+  -Uri  "https://graph.microsoft.com/v1.0/sites/$siteId/permissions" `
+  -Body $body -ContentType "application/json"
+
+$grant.id   # note this — needed only to revoke later
+```
+
+You don't need to keep the permission id, but noting it makes revocation easier later:
+
+```powershell
+Invoke-MgGraphRequest -Method DELETE `
+  -Uri "https://graph.microsoft.com/v1.0/sites/$siteId/permissions/$($grant.id)"
+```
+
+##### Step 4 — Verify the pipeline can actually read the file
+
+Impersonation isn't possible for a managed identity from your laptop, so the cleanest verification is to run the pipeline in dry-run mode (`whatIf = true`, the default). A successful run logs the CSV source URL and row count in its preamble — that proves the whole chain (tenant grant → site grant → file fetch) works. If Graph returns 401/403 there, jump to the [Common failure modes](#common-failure-modes) section for the fix path.
 
 #### 3c. Azure DevOps
 
