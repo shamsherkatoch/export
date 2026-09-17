@@ -40,7 +40,7 @@ jobs:
         inputs:
           azureSubscription: $(serviceConnectionName)
           scriptType: FilePath
-          scriptPath: scripts/Invoke-TagReconciliation.ps1
+          scriptPath: FinOps/scripts/Invoke-TagReconciliation.ps1
           scriptArguments: >-
             -SharePointHostname "$(sharePointHostname)"
             -SharePointSitePath "$(sharePointSitePath)"
