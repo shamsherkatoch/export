@@ -8,12 +8,15 @@ Reconcile Azure resource-group tags against a CSV stored in SharePoint Online.
 .DESCRIPTION
 See CLAUDE.md at the repo root for the spec. Summary:
   - Read the CSV from SharePoint via Microsoft Graph, using the UAMI's OAuth token.
-  - Enumerate every subscription under -ManagementGroupId, then every resource group in each.
-  - For each RG whose (SubscriptionId, ResourceGroupName) is present in the CSV,
-    reconcile only these tag keys: BusinessUnit, CostObject, GeneralLedgerCode, FinancialDelegate.
+  - Enumerate every subscription under -ManagementGroupId (returns both id and display name).
+  - Match by SubscriptionName (case-insensitive) against the CSV. Subscriptions whose
+    display name is not present in the CSV are skipped entirely.
+  - For each matched subscription, apply the CSV row's tag values to EVERY resource
+    group in that subscription. Reconciled tag keys:
+    BusinessUnit, CostObject, GeneralLedgerCode, FinancialDelegate.
   - Values are trimmed of all whitespace and uppercased before compare/write.
+  - Only keys whose current tag value differs from the CSV value are written.
   - Writes MERGE — tags outside the four managed keys are never touched.
-  - RGs whose row is not in the CSV are left entirely alone.
 
 .PARAMETER SharePointHostname
 Tenant hostname, e.g. "contoso.sharepoint.com".
@@ -72,12 +75,15 @@ function Get-CsvFromSharePoint {
     $token = Get-AccessTokenPlain -ResourceUrl 'https://graph.microsoft.com'
 
     $siteUri = "https://graph.microsoft.com/v1.0/sites/${Hostname}:${SitePath}"
+    Write-Host "GET $siteUri"
     $site = Invoke-GraphGet -Uri $siteUri -Token $token
+    Write-Host "  siteId = $($site.id)"
 
     $encodedSegments = ($ItemPath -split '/') | Where-Object { $_ } | ForEach-Object { [System.Uri]::EscapeDataString($_) }
     $encodedPath = $encodedSegments -join '/'
     $downloadUri = "https://graph.microsoft.com/v1.0/sites/$($site.id)/drive/root:/${encodedPath}:/content"
 
+    Write-Host "GET $downloadUri"
     $raw = Invoke-RestMethod -Method GET -Uri $downloadUri -Headers @{ Authorization = "Bearer $token" }
     if ($raw -is [byte[]]) { $raw = [System.Text.Encoding]::UTF8.GetString($raw) }
     return @($raw | ConvertFrom-Csv)
@@ -87,15 +93,21 @@ function Get-SubscriptionsUnderManagementGroup {
     param([string] $ManagementGroupId)
     $token = Get-AccessTokenPlain -ResourceUrl 'https://management.azure.com'
     $uri = "https://management.azure.com/providers/Microsoft.Management/managementGroups/$ManagementGroupId/descendants?api-version=2020-05-01"
-    $subs = New-Object System.Collections.Generic.List[string]
+    $subs = New-Object System.Collections.Generic.List[object]
     while ($uri) {
         $resp = Invoke-RestMethod -Method GET -Uri $uri -Headers @{ Authorization = "Bearer $token" }
         foreach ($node in $resp.value) {
             if ($node.type -eq 'Microsoft.Management/managementGroups/subscriptions') {
-                $subs.Add($node.name)   # $node.name is the subscription GUID
+                # $node.name is the subscription GUID; $node.properties.displayName is the display name.
+                $subs.Add([pscustomobject]@{
+                    Id   = $node.name
+                    Name = $node.properties.displayName
+                })
             }
         }
-        $uri = $resp.nextLink
+        # Under Set-StrictMode -Version Latest, accessing a JSON property that isn't
+        # present (single-page responses omit `nextLink`) throws. Probe the shape first.
+        $uri = if ($resp.PSObject.Properties.Name -contains 'nextLink') { $resp.nextLink } else { $null }
     }
     return $subs
 }
@@ -104,7 +116,7 @@ function New-CsvIndex {
     param([object[]] $Rows)
     if (-not $Rows -or $Rows.Count -eq 0) { throw "CSV is empty." }
 
-    $required = @('SubscriptionId', 'ResourceGroupName') + $script:ManagedKeys
+    $required = @('SubscriptionName') + $script:ManagedKeys
     $present = $Rows[0].PSObject.Properties.Name
     foreach ($col in $required) {
         if ($present -notcontains $col) { throw "CSV is missing required column: $col" }
@@ -112,17 +124,15 @@ function New-CsvIndex {
 
     $index = @{}
     foreach ($row in $Rows) {
-        $subId = "$($row.SubscriptionId)".Trim().ToLowerInvariant()
-        $rgName = "$($row.ResourceGroupName)".Trim().ToLowerInvariant()
-        if (-not $subId -or -not $rgName) { continue }
-        $key = "$subId/$rgName"
+        $subName = "$($row.SubscriptionName)".Trim().ToLowerInvariant()
+        if (-not $subName) { continue }
 
         $desired = @{}
         foreach ($k in $script:ManagedKeys) {
             $normalized = ConvertTo-NormalizedTagValue -Value $row.$k
             if ($null -ne $normalized) { $desired[$k] = $normalized }
         }
-        $index[$key] = $desired
+        $index[$subName] = $desired
     }
     return $index
 }
@@ -182,38 +192,53 @@ $rows = Get-CsvFromSharePoint -Hostname $SharePointHostname -SitePath $SharePoin
 Write-Host "CSV rows: $($rows.Count)"
 
 $csvIndex = New-CsvIndex -Rows $rows
-Write-Host "Unique (subscription, RG) entries in CSV: $($csvIndex.Count)"
+Write-Host "Unique SubscriptionName entries in CSV: $($csvIndex.Count)"
 
 $subs = Get-SubscriptionsUnderManagementGroup -ManagementGroupId $ManagementGroupId
 Write-Host "Subscriptions under MG '$ManagementGroupId': $($subs.Count)"
 
-$stats = [ordered]@{ rgsInspected = 0; rgsMatched = 0; rgsUpdated = 0; rgsUnchanged = 0 }
+$stats = [ordered]@{
+    subsInspected = 0
+    subsMatched   = 0
+    subsSkipped   = 0
+    rgsInspected  = 0
+    rgsUpdated    = 0
+    rgsUnchanged  = 0
+}
 
-foreach ($subId in $subs) {
+foreach ($sub in $subs) {
+    $stats.subsInspected++
     Write-Host ""
-    Write-Host "=== Subscription: $subId ==="
+    Write-Host "=== Subscription: $($sub.Name) ($($sub.Id)) ==="
+
+    $key = "$($sub.Name)".Trim().ToLowerInvariant()
+    if (-not $csvIndex.ContainsKey($key)) {
+        Write-Host "  skipped — SubscriptionName '$($sub.Name)' not in CSV"
+        $stats.subsSkipped++
+        continue
+    }
+    $stats.subsMatched++
+    $desired = $csvIndex[$key]
+
     try {
-        $null = Set-AzContext -SubscriptionId $subId -WarningAction SilentlyContinue
+        $null = Set-AzContext -SubscriptionId $sub.Id -WarningAction SilentlyContinue
     } catch {
-        Write-Warning "Skipping $subId — Set-AzContext failed: $($_.Exception.Message)"
+        Write-Warning "Skipping $($sub.Name) ($($sub.Id)) — Set-AzContext failed: $($_.Exception.Message)"
         continue
     }
 
     $rgs = Get-AzResourceGroup
     foreach ($rg in $rgs) {
         $stats.rgsInspected++
-        $key = "$($subId.ToLowerInvariant())/$($rg.ResourceGroupName.ToLowerInvariant())"
-        if (-not $csvIndex.ContainsKey($key)) { continue }
-        $stats.rgsMatched++
 
         $before = @{}
         if ($rg.Tags) { foreach ($e in $rg.Tags.GetEnumerator()) { $before[$e.Key] = $e.Value } }
 
-        Sync-ResourceGroupTags -ResourceGroup $rg -Desired $csvIndex[$key] -WhatIfMode:$WhatIfMode
+        Sync-ResourceGroupTags -ResourceGroup $rg -Desired $desired -WhatIfMode:$WhatIfMode
 
         $changed = $false
-        foreach ($k in $csvIndex[$key].Keys) {
-            if ($before[$k] -ne $csvIndex[$key][$k]) { $changed = $true; break }
+        foreach ($k in $desired.Keys) {
+            if ($before[$k] -ne $desired[$k]) { $changed = $true; break }
         }
         if ($changed) { $stats.rgsUpdated++ } else { $stats.rgsUnchanged++ }
     }
@@ -221,5 +246,6 @@ foreach ($subId in $subs) {
 
 Write-Host ""
 Write-Host "Done. WhatIfMode=$WhatIfMode"
-Write-Host ("Summary: inspected={0}, matched={1}, updated={2}, unchanged={3}" -f `
-    $stats.rgsInspected, $stats.rgsMatched, $stats.rgsUpdated, $stats.rgsUnchanged)
+Write-Host ("Summary: subs inspected={0}, matched={1}, skipped={2} | rgs inspected={3}, updated={4}, unchanged={5}" -f `
+    $stats.subsInspected, $stats.subsMatched, $stats.subsSkipped, `
+    $stats.rgsInspected, $stats.rgsUpdated, $stats.rgsUnchanged)

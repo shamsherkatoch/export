@@ -27,11 +27,12 @@ The list lives in the script as `$script:ManagedKeys` — that array is the auth
 
 The CSV loaded from SharePoint must have a header row with, at minimum, these columns:
 
-- `SubscriptionId` — subscription GUID.
-- `ResourceGroupName` — RG name (case-insensitive; lower-cased when building the lookup key).
-- `BusinessUnit`, `CostObject`, `GeneralLedgerCode`, `FinancialDelegate` — the four managed tag values.
+- `SubscriptionName` — subscription **display name** (case-insensitive, trimmed, lower-cased when building the lookup key). This is the sole match key. The script does not read subscription IDs from the CSV and does not require an RG-name column.
+- `BusinessUnit`, `CostObject`, `GeneralLedgerCode`, `FinancialDelegate` — the four managed tag values applied to every RG under the matched subscription.
 
-`New-CsvIndex` throws if any required column is missing. Rows with an empty `SubscriptionId` or `ResourceGroupName` are skipped. The lookup key is `"<subId lower>/<rgName lower>"`.
+`New-CsvIndex` throws if any required column is missing. Rows with an empty `SubscriptionName` are skipped. Extra columns (e.g. `SubscriptionId` kept for humans, `Owner`, `Comments`) are allowed but not read. The lookup key is `"<subscriptionName lower>"`.
+
+Duplicate `SubscriptionName` rows silently let the later row win (last-write wins in `$index`). Deduplicate at the source.
 
 ## Value normalization
 
@@ -48,12 +49,12 @@ Compare-and-update runs against the normalized value — a resource group whose 
 - **Trigger**: Azure DevOps pipeline, Microsoft-hosted `windows-latest` agent, `AzurePowerShell@5` task with `pwsh: true` and `azurePowerShellVersion: LatestVersion`.
 - **Auth**: UAMI + workload-identity federated service connection (variable `serviceConnectionName`). No secrets in pipeline variables or scripts.
 - **CSV fetch**: Microsoft Graph. Token is acquired via `Get-AzAccessToken -ResourceUrl 'https://graph.microsoft.com'` and unwrapped from `SecureString` when needed. The site is resolved with `GET /v1.0/sites/{hostname}:{sitePath}`, then the file is fetched with `GET /v1.0/sites/{siteId}/drive/root:/{urlEscapedItemPath}:/content`.
-- **Scope enumeration**: `GET https://management.azure.com/providers/Microsoft.Management/managementGroups/{id}/descendants?api-version=2020-05-01`, paginated via `nextLink`. Only nodes of type `Microsoft.Management/managementGroups/subscriptions` are collected (their `name` is the subscription GUID).
-- **Per subscription**: `Set-AzContext -SubscriptionId $subId`, then `Get-AzResourceGroup` to list RGs. If `Set-AzContext` fails the subscription is skipped with a warning.
-- **Per resource group**: skip RGs not present in the CSV index. For matched RGs, compute the diff between current tags and the desired normalized values, log every key (`match` vs `'old' -> 'new'`), and either write or log a WhatIf line.
+- **Scope enumeration**: `GET https://management.azure.com/providers/Microsoft.Management/managementGroups/{id}/descendants?api-version=2020-05-01`, paginated via `nextLink`. Only nodes of type `Microsoft.Management/managementGroups/subscriptions` are collected; both `name` (subscription GUID) and `properties.displayName` (subscription display name) are captured for each.
+- **Per subscription**: match `properties.displayName` (case-insensitive, trimmed) against the CSV's `SubscriptionName` index. Subscriptions not in the CSV are skipped with a `skipped — SubscriptionName ... not in CSV` log line. For matched subscriptions, `Set-AzContext -SubscriptionId $sub.Id`, then `Get-AzResourceGroup` to list every RG. If `Set-AzContext` fails, the subscription is skipped with a warning.
+- **Per resource group**: every RG in a matched subscription receives the CSV row's tag values. Compute the diff between current tags and the desired normalized values, log every key (`match` vs `'old' -> 'new'`), and either write or log a WhatIf line. Only keys whose current value differs from the CSV value are written.
 - **Write**: `Update-AzTag -ResourceId $rg.ResourceId -Tag $toUpdate -Operation Merge`. Merge is required — never `-Operation Replace`.
 - **Verify**: after write, re-fetch the RG with `Get-AzResourceGroup` and assert each written key equals the expected normalized value. Mismatch throws.
-- **Summary**: script prints `inspected / matched / updated / unchanged` counts at the end.
+- **Summary**: script prints subscription counts (`subs inspected / matched / skipped`) and RG counts (`rgs inspected / updated / unchanged`) at the end.
 
 ## Pipeline parameters and variables
 
@@ -78,7 +79,8 @@ Pipeline variables defined directly on the pipeline (**Pipeline → Edit → Var
 ## Preservation rules
 
 - Any tag write must **merge**, never replace: only the four managed keys may be touched. Tags outside those keys must remain on the resource group. A write that sends the full tag hashtable without preserving existing keys is a bug.
-- Resource groups whose row is not present in the CSV must not be modified at all — the script `continue`s past them before any diff/write logic.
+- Subscriptions whose `SubscriptionName` is not present in the CSV must not be entered at all — the script `continue`s past them before calling `Set-AzContext` or `Get-AzResourceGroup`.
+- Only tag keys whose current RG value differs from the CSV value are written; matching keys are logged as `match` and not sent to `Update-AzTag`.
 - Log per resource group: keys inspected, current value vs. normalized CSV value, and whether an update was issued. After write, re-read the RG tags and confirm the normalized value is present (already implemented in `Sync-ResourceGroupTags`).
 
 ## Conventions for future changes
@@ -93,6 +95,18 @@ Pipeline variables defined directly on the pipeline (**Pipeline → Edit → Var
 
 Newest first. One entry per change. Format: `YYYY-MM-DD — <short summary>`, followed by a short bullet list of what changed and why.
 
+- 2026-09-18 — Fix `nextLink` StrictMode crash in `Get-SubscriptionsUnderManagementGroup`.
+  - `scripts/Invoke-TagReconciliation.ps1` — probe `$resp.PSObject.Properties.Name -contains 'nextLink'` before reading `$resp.nextLink`. Under `Set-StrictMode -Version Latest`, a single-page descendants response (no `nextLink` in the JSON) was throwing `The property 'nextLink' cannot be found on this object.`
+  - No behavior change for multi-page responses; only difference is that single-page responses no longer crash the run.
+- 2026-09-18 — Switch match key from `ResourceGroupName` to `SubscriptionName` (subscription display name).
+  - `scripts/Invoke-TagReconciliation.ps1` — `New-CsvIndex` now requires a `SubscriptionName` column instead of `ResourceGroupName`; the index is keyed by subscription display name (case-insensitive, trimmed, lower-cased). `Get-SubscriptionsUnderManagementGroup` now returns `{Id, Name}` objects instead of bare GUIDs (using `properties.displayName` from the descendants API). Main loop matches on subscription name; every RG in a matched subscription receives the CSV row's tag values. Subscriptions not in the CSV are skipped before `Set-AzContext`.
+  - `$stats` now tracks `subsInspected / subsMatched / subsSkipped` in addition to `rgsInspected / rgsUpdated / rgsUnchanged`; the trailing `rgsMatched` counter was dropped because in this design every inspected RG is a matched RG.
+  - Rationale: FinOps ownership in this environment is defined at subscription granularity, not per RG. Matching on subscription display name (not GUID) keeps the CSV human-readable and stable across tenant moves.
+  - Per-key diff-and-merge in `Sync-ResourceGroupTags` is unchanged: only keys whose current value differs from the normalized CSV value are written.
+  - CSV contract in this spec and `README.md` updated accordingly.
+- 2026-09-18 — Log Graph URLs in `Get-CsvFromSharePoint` for pipeline debugging.
+  - `scripts/Invoke-TagReconciliation.ps1` now writes `GET <siteUri>`, the resolved `siteId`, and `GET <downloadUri>` to the host stream before the two Graph calls that resolve the site and download the CSV.
+  - Purpose: 404s and 401/403s from Graph are hard to diagnose without seeing the exact URLs — this puts them into the ADO run log without changing any control flow.
 - 2026-09-17 — Added placeholder pipeline variables inline.
   - `pipelines/azure-pipelines.yml` now defines `serviceConnectionName`, `sharePointHostname`, `sharePointSitePath`, `csvItemPath`, and `managementGroupId` under `variables:` with `dummy-*` values so the YAML validates on its own.
   - These are placeholders only — the pipeline's own **Variables** section (ADO UI) is expected to override each before the first real run. Do not commit real values here; the YAML defaults are for scaffolding, not for production.

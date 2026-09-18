@@ -22,7 +22,7 @@ variables:
   serviceConnectionName: "sc-finops-tags"
   sharePointHostname: "mycloudgurucom.sharepoint.com"
   sharePointSitePath: "/sites/mycloudguru"
-  csvItemPath: "/Shared%20Documents/poc/tags.csv"
+  csvItemPath: "poc/tags.csv"
   managementGroupId: "MCGAU"
 
 pool:
@@ -46,7 +46,7 @@ jobs:
             -SharePointSitePath "$(sharePointSitePath)"
             -CsvItemPath "$(csvItemPath)"
             -ManagementGroupId "$(managementGroupId)"
-            -WhatIfMode ${{ parameters.whatIf }}
+            -WhatIfMode:$${{ parameters.whatIf }}
           azurePowerShellVersion: LatestVersion
           pwsh: true
           failOnStandardError: true
