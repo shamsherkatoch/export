@@ -27,12 +27,13 @@ The list lives in the script as `$script:ManagedKeys` — that array is the auth
 
 The CSV loaded from SharePoint must have a header row with, at minimum, these columns:
 
-- `SubscriptionName` — subscription **display name** (case-insensitive, trimmed, lower-cased when building the lookup key). This is the sole match key. The script does not read subscription IDs from the CSV and does not require an RG-name column.
-- `BusinessUnit`, `CostObject`, `GeneralLedgerCode`, `FinancialDelegate` — the four managed tag values applied to every RG under the matched subscription.
+- `SubscriptionName` — subscription **display name** (case-insensitive, trimmed, lower-cased when building the lookup key). Match half #1.
+- `ResourceGroupName` — RG name (case-insensitive, trimmed, lower-cased). Match half #2. A CSV row targets exactly one RG in exactly one subscription.
+- `BusinessUnit`, `CostObject`, `GeneralLedgerCode`, `FinancialDelegate` — the four managed tag values applied to the matched RG.
 
-`New-CsvIndex` throws if any required column is missing. Rows with an empty `SubscriptionName` are skipped. Extra columns (e.g. `SubscriptionId` kept for humans, `Owner`, `Comments`) are allowed but not read. The lookup key is `"<subscriptionName lower>"`.
+`New-CsvIndex` throws if any required column is missing. Rows with an empty `SubscriptionName` **or** `ResourceGroupName` are skipped. Extra columns (e.g. `SubscriptionId` kept for humans, `Owner`, `Comments`) are allowed but not read.
 
-Duplicate `SubscriptionName` rows silently let the later row win (last-write wins in `$index`). Deduplicate at the source.
+The index is a nested hashtable: `$index[<subName lower>][<rgName lower>] = @{ tagKey = normalizedValue }`. Duplicate `(SubscriptionName, ResourceGroupName)` pairs silently let the later row win — deduplicate at the source.
 
 ## Value normalization
 
@@ -42,7 +43,7 @@ CSV values are never written verbatim. `ConvertTo-NormalizedTagValue` performs:
 2. Uppercase using invariant culture.
 3. Return `$null` for null/whitespace-only input; keys with a `$null` normalized value are dropped from the desired set for that row.
 
-Compare-and-update runs against the normalized value — a resource group whose current tag already equals the normalized value is a no-op (logged as `match`).
+Compare-and-update runs both sides through `ConvertTo-NormalizedTagValue` before comparing — the current RG tag value AND the CSV value are reduced to the same canonical form (whitespace-stripped, `ToUpperInvariant`) and compared with `-ne`. The compare is therefore case-insensitive and whitespace-insensitive. A resource group whose current tag equals the CSV value under this canonical compare is a no-op (logged as `match`), regardless of the RG's actual stored casing or embedded whitespace.
 
 ## Runtime shape
 
@@ -50,11 +51,11 @@ Compare-and-update runs against the normalized value — a resource group whose 
 - **Auth**: UAMI + workload-identity federated service connection (variable `serviceConnectionName`). No secrets in pipeline variables or scripts.
 - **CSV fetch**: Microsoft Graph. Token is acquired via `Get-AzAccessToken -ResourceUrl 'https://graph.microsoft.com'` and unwrapped from `SecureString` when needed. The site is resolved with `GET /v1.0/sites/{hostname}:{sitePath}`, then the file is fetched with `GET /v1.0/sites/{siteId}/drive/root:/{urlEscapedItemPath}:/content`.
 - **Scope enumeration**: `GET https://management.azure.com/providers/Microsoft.Management/managementGroups/{id}/descendants?api-version=2020-05-01`, paginated via `nextLink`. Only nodes of type `Microsoft.Management/managementGroups/subscriptions` are collected; both `name` (subscription GUID) and `properties.displayName` (subscription display name) are captured for each.
-- **Per subscription**: match `properties.displayName` (case-insensitive, trimmed) against the CSV's `SubscriptionName` index. Subscriptions not in the CSV are skipped with a `skipped — SubscriptionName ... not in CSV` log line. For matched subscriptions, `Set-AzContext -SubscriptionId $sub.Id`, then `Get-AzResourceGroup` to list every RG. If `Set-AzContext` fails, the subscription is skipped with a warning.
-- **Per resource group**: every RG in a matched subscription receives the CSV row's tag values. Compute the diff between current tags and the desired normalized values, log every key (`match` vs `'old' -> 'new'`), and either write or log a WhatIf line. Only keys whose current value differs from the CSV value are written.
+- **Per subscription**: match `properties.displayName` (case-insensitive, trimmed) against the top level of the CSV index. Subscriptions with no CSV rows are skipped with a `skipped — SubscriptionName ... not in CSV` log line — no `Set-AzContext`, no `Get-AzResourceGroup`. For matched subscriptions, `Set-AzContext -SubscriptionId $sub.Id`, then `Get-AzResourceGroup` to list every RG. If `Set-AzContext` fails, the subscription is skipped with a warning.
+- **Per resource group**: look up `$rgRules[<rgName lower>]` in the matched subscription's rules; if absent, the RG is not in the CSV and is skipped. If present, compute the diff between current tags and the desired normalized values, log every key (`match` vs `'old' -> 'new'`), and either write or log a WhatIf line. Only keys whose current value differs from the CSV value are written.
 - **Write**: `Update-AzTag -ResourceId $rg.ResourceId -Tag $toUpdate -Operation Merge`. Merge is required — never `-Operation Replace`.
 - **Verify**: after write, re-fetch the RG with `Get-AzResourceGroup` and assert each written key equals the expected normalized value. Mismatch throws.
-- **Summary**: script prints subscription counts (`subs inspected / matched / skipped`) and RG counts (`rgs inspected / updated / unchanged`) at the end.
+- **Summary**: script prints subscription counts (`subs inspected / matched / skipped`) and RG counts (`rgs inspected / matched / updated / unchanged`) at the end. `matched` = RGs whose `(sub, rg)` pair had a CSV row; `updated + unchanged = matched`.
 
 ## Pipeline parameters and variables
 
@@ -80,6 +81,7 @@ Pipeline variables defined directly on the pipeline (**Pipeline → Edit → Var
 
 - Any tag write must **merge**, never replace: only the four managed keys may be touched. Tags outside those keys must remain on the resource group. A write that sends the full tag hashtable without preserving existing keys is a bug.
 - Subscriptions whose `SubscriptionName` is not present in the CSV must not be entered at all — the script `continue`s past them before calling `Set-AzContext` or `Get-AzResourceGroup`.
+- Resource groups whose `(SubscriptionName, ResourceGroupName)` pair is not in the CSV must not be modified — inside a matched subscription, the script `continue`s past any RG whose name doesn't appear in `$rgRules`.
 - Only tag keys whose current RG value differs from the CSV value are written; matching keys are logged as `match` and not sent to `Update-AzTag`.
 - Log per resource group: keys inspected, current value vs. normalized CSV value, and whether an update was issued. After write, re-read the RG tags and confirm the normalized value is present (already implemented in `Sync-ResourceGroupTags`).
 
@@ -95,6 +97,15 @@ Pipeline variables defined directly on the pipeline (**Pipeline → Edit → Var
 
 Newest first. One entry per change. Format: `YYYY-MM-DD — <short summary>`, followed by a short bullet list of what changed and why.
 
+- 2026-09-18 — Warn on rows with missing match keys; normalize current tag value before compare.
+  - `scripts/Invoke-TagReconciliation.ps1` — `New-CsvIndex` now emits a `Write-Warning` for each CSV data row that has an empty `SubscriptionName` or `ResourceGroupName` (previously silently `continue`d), and prints a summary count if any rows were skipped. Rows with either match key blank are still ignored — they cannot target an RG unambiguously.
+  - `Sync-ResourceGroupTags` — the per-key compare now runs `ConvertTo-NormalizedTagValue` on the current RG tag value before comparing to the desired value, so both sides are the same canonical form (whitespace-stripped, `ToUpperInvariant`). PowerShell's `-ne` was already case-insensitive, but the sides were asymmetric (raw vs normalized); the fix makes case- and whitespace-insensitivity explicit and symmetric.
+  - Verify block is unchanged: it still compares Azure's post-write echo against the exact value we sent.
+- 2026-09-18 — Require both `SubscriptionName` and `ResourceGroupName` in the CSV; match on the pair.
+  - `scripts/Invoke-TagReconciliation.ps1` — `New-CsvIndex` now requires both columns and builds a nested hashtable `$index[<subName>][<rgName>] = @{tag = value}`. Main loop skips a subscription outright when it has no CSV rows (no `Set-AzContext`, no `Get-AzResourceGroup`); inside a matched subscription, RGs whose name isn't in that subscription's rules are skipped.
+  - `$stats.rgsMatched` reinstated; summary now prints `rgs inspected / matched / updated / unchanged`.
+  - Rationale: the sub-only design was applying every subscription's row to every RG in that subscription, which was too broad. The composite key lets a CSV row target one specific RG in one specific subscription and leaves everything else alone.
+  - CSV contract in this spec and `README.md` updated accordingly.
 - 2026-09-18 — Fix `nextLink` StrictMode crash in `Get-SubscriptionsUnderManagementGroup`.
   - `scripts/Invoke-TagReconciliation.ps1` — probe `$resp.PSObject.Properties.Name -contains 'nextLink'` before reading `$resp.nextLink`. Under `Set-StrictMode -Version Latest`, a single-page descendants response (no `nextLink` in the JSON) was throwing `The property 'nextLink' cannot be found on this object.`
   - No behavior change for multi-page responses; only difference is that single-page responses no longer crash the run.

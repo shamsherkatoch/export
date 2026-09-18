@@ -9,10 +9,10 @@ Reconcile Azure resource-group tags against a CSV stored in SharePoint Online.
 See CLAUDE.md at the repo root for the spec. Summary:
   - Read the CSV from SharePoint via Microsoft Graph, using the UAMI's OAuth token.
   - Enumerate every subscription under -ManagementGroupId (returns both id and display name).
-  - Match by SubscriptionName (case-insensitive) against the CSV. Subscriptions whose
-    display name is not present in the CSV are skipped entirely.
-  - For each matched subscription, apply the CSV row's tag values to EVERY resource
-    group in that subscription. Reconciled tag keys:
+  - Match by the pair (SubscriptionName, ResourceGroupName), both case-insensitive.
+    Subscriptions with no CSV rows are skipped entirely (no Set-AzContext, no RG listing).
+    Inside a matched subscription, only RGs listed in that subscription's CSV rows are touched.
+  - For each matched (subscription, RG), reconcile these tag keys against the CSV row:
     BusinessUnit, CostObject, GeneralLedgerCode, FinancialDelegate.
   - Values are trimmed of all whitespace and uppercased before compare/write.
   - Only keys whose current tag value differs from the CSV value are written.
@@ -116,23 +116,37 @@ function New-CsvIndex {
     param([object[]] $Rows)
     if (-not $Rows -or $Rows.Count -eq 0) { throw "CSV is empty." }
 
-    $required = @('SubscriptionName') + $script:ManagedKeys
+    $required = @('SubscriptionName', 'ResourceGroupName') + $script:ManagedKeys
     $present = $Rows[0].PSObject.Properties.Name
     foreach ($col in $required) {
         if ($present -notcontains $col) { throw "CSV is missing required column: $col" }
     }
 
+    # Nested index: $index[<subName>][<rgName>] = @{ tagKey = normalizedValue }
     $index = @{}
+    $skippedRows = 0
+    $rowNumber = 1   # header is row 1; data rows start at 2
     foreach ($row in $Rows) {
+        $rowNumber++
         $subName = "$($row.SubscriptionName)".Trim().ToLowerInvariant()
-        if (-not $subName) { continue }
+        $rgName  = "$($row.ResourceGroupName)".Trim().ToLowerInvariant()
+        if (-not $subName -or -not $rgName) {
+            Write-Warning "CSV row $rowNumber skipped — missing SubscriptionName or ResourceGroupName (SubscriptionName='$($row.SubscriptionName)', ResourceGroupName='$($row.ResourceGroupName)')."
+            $skippedRows++
+            continue
+        }
 
         $desired = @{}
         foreach ($k in $script:ManagedKeys) {
             $normalized = ConvertTo-NormalizedTagValue -Value $row.$k
             if ($null -ne $normalized) { $desired[$k] = $normalized }
         }
-        $index[$subName] = $desired
+
+        if (-not $index.ContainsKey($subName)) { $index[$subName] = @{} }
+        $index[$subName][$rgName] = $desired
+    }
+    if ($skippedRows -gt 0) {
+        Write-Host "New-CsvIndex: $skippedRows row(s) skipped due to missing SubscriptionName or ResourceGroupName."
     }
     return $index
 }
@@ -154,7 +168,12 @@ function Sync-ResourceGroupTags {
     $toUpdate = @{}
     foreach ($k in $Desired.Keys) {
         $curVal = $current[$k]
-        if ($curVal -ne $Desired[$k]) {
+        # Normalize BOTH sides identically before compare — same whitespace-strip +
+        # ToUpperInvariant treatment used on the CSV. Ensures the compare is
+        # case-insensitive and whitespace-insensitive; -ne on the normalized values
+        # is then a canonical-form comparison.
+        $curNormalized = ConvertTo-NormalizedTagValue -Value $curVal
+        if ($curNormalized -ne $Desired[$k]) {
             $toUpdate[$k] = $Desired[$k]
             Write-Host "  [$($ResourceGroup.ResourceGroupName)] $k : '$curVal' -> '$($Desired[$k])'"
         } else {
@@ -192,7 +211,8 @@ $rows = Get-CsvFromSharePoint -Hostname $SharePointHostname -SitePath $SharePoin
 Write-Host "CSV rows: $($rows.Count)"
 
 $csvIndex = New-CsvIndex -Rows $rows
-Write-Host "Unique SubscriptionName entries in CSV: $($csvIndex.Count)"
+$totalRules = ($csvIndex.Values | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum
+Write-Host "CSV subscriptions: $($csvIndex.Count); total (sub, RG) rules: $totalRules"
 
 $subs = Get-SubscriptionsUnderManagementGroup -ManagementGroupId $ManagementGroupId
 Write-Host "Subscriptions under MG '$ManagementGroupId': $($subs.Count)"
@@ -202,6 +222,7 @@ $stats = [ordered]@{
     subsMatched   = 0
     subsSkipped   = 0
     rgsInspected  = 0
+    rgsMatched    = 0
     rgsUpdated    = 0
     rgsUnchanged  = 0
 }
@@ -211,14 +232,14 @@ foreach ($sub in $subs) {
     Write-Host ""
     Write-Host "=== Subscription: $($sub.Name) ($($sub.Id)) ==="
 
-    $key = "$($sub.Name)".Trim().ToLowerInvariant()
-    if (-not $csvIndex.ContainsKey($key)) {
+    $subKey = "$($sub.Name)".Trim().ToLowerInvariant()
+    if (-not $csvIndex.ContainsKey($subKey)) {
         Write-Host "  skipped — SubscriptionName '$($sub.Name)' not in CSV"
         $stats.subsSkipped++
         continue
     }
     $stats.subsMatched++
-    $desired = $csvIndex[$key]
+    $rgRules = $csvIndex[$subKey]
 
     try {
         $null = Set-AzContext -SubscriptionId $sub.Id -WarningAction SilentlyContinue
@@ -230,6 +251,11 @@ foreach ($sub in $subs) {
     $rgs = Get-AzResourceGroup
     foreach ($rg in $rgs) {
         $stats.rgsInspected++
+        $rgKey = $rg.ResourceGroupName.ToLowerInvariant()
+        if (-not $rgRules.ContainsKey($rgKey)) { continue }
+        $stats.rgsMatched++
+
+        $desired = $rgRules[$rgKey]
 
         $before = @{}
         if ($rg.Tags) { foreach ($e in $rg.Tags.GetEnumerator()) { $before[$e.Key] = $e.Value } }
@@ -246,6 +272,6 @@ foreach ($sub in $subs) {
 
 Write-Host ""
 Write-Host "Done. WhatIfMode=$WhatIfMode"
-Write-Host ("Summary: subs inspected={0}, matched={1}, skipped={2} | rgs inspected={3}, updated={4}, unchanged={5}" -f `
+Write-Host ("Summary: subs inspected={0}, matched={1}, skipped={2} | rgs inspected={3}, matched={4}, updated={5}, unchanged={6}" -f `
     $stats.subsInspected, $stats.subsMatched, $stats.subsSkipped, `
-    $stats.rgsInspected, $stats.rgsUpdated, $stats.rgsUnchanged)
+    $stats.rgsInspected, $stats.rgsMatched, $stats.rgsUpdated, $stats.rgsUnchanged)

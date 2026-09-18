@@ -7,14 +7,14 @@ For the authoritative spec (managed keys, normalization rules, preservation rule
 ## What it does
 
 - Pulls a CSV from SharePoint via Microsoft Graph.
-- Builds an index keyed by **`SubscriptionName`** (case-insensitive, lower-cased). Match is by subscription display name — the CSV does not carry subscription IDs and does not carry RG names.
+- Builds a nested index keyed by the pair **`(SubscriptionName, ResourceGroupName)`** — both case-insensitive and lower-cased. Every CSV row targets exactly one RG in exactly one subscription.
 - Enumerates every subscription under the configured management group (both id and display name captured from the descendants API).
-- For each subscription whose display name appears in the CSV, applies the row's four managed tag values (`BusinessUnit`, `CostObject`, `GeneralLedgerCode`, `FinancialDelegate`) to **every resource group in that subscription**, after normalization (strip all whitespace, uppercase invariant).
-- Merges only the keys whose current value differs from the CSV — matching keys are a no-op, unmanaged tags on the RG are left untouched.
+- For each subscription whose display name appears in the CSV, opens context on it and lists its RGs.
+- For each RG whose `(sub, rg)` pair is in the CSV, compares the four managed tag values (`BusinessUnit`, `CostObject`, `GeneralLedgerCode`, `FinancialDelegate`) after normalization (strip all whitespace, uppercase invariant) and merges only the keys whose current value differs from the CSV. Unmanaged tags on the RG are left untouched.
 - Re-reads the RG after writing and asserts the values took.
-- Prints a summary: `subs inspected/matched/skipped` and `rgs inspected/updated/unchanged`.
+- Prints a summary: `subs inspected/matched/skipped` and `rgs inspected/matched/updated/unchanged`.
 
-Subscriptions whose display name is not in the CSV are skipped entirely — the script does not enter them or list their RGs.
+Subscriptions whose display name is not in the CSV are skipped entirely — the script does not enter them or list their RGs. Inside a matched subscription, RGs whose name isn't in that subscription's CSV rows are left alone.
 
 ## Repository layout
 
@@ -134,7 +134,7 @@ Connect-MgGraph -Scopes `
 Assigns the Graph `Sites.Selected` app role to the UAMI's service principal. Do this once per UAMI.
 
 ```powershell
-$uamiObjectId      = "e1856993-f28d-4298-9e07-3aec23b77e4a"   # principalId of the managed identity
+$uamiObjectId      = "e1856993-XXXXX"   # principalId of the managed identity
 $graphSp           = Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'"
 $sitesSelectedRole = $graphSp.AppRoles | Where-Object { $_.Value -eq "Sites.Selected" }
 
@@ -214,12 +214,12 @@ The workload-identity service connection (`serviceConnectionName`) must be **aut
 CSV in SharePoint must have (at minimum) these headers:
 
 ```
-SubscriptionName,BusinessUnit,CostObject,GeneralLedgerCode,FinancialDelegate
+SubscriptionName,ResourceGroupName,BusinessUnit,CostObject,GeneralLedgerCode,FinancialDelegate
 ```
 
-Match is by `SubscriptionName` alone — the subscription's **display name** as shown in the Azure portal / `descendants` API. The script does not read subscription IDs from the CSV and does not carry an RG-name column. One row applies to every RG in the matched subscription.
+Match is by the pair `(SubscriptionName, ResourceGroupName)`. `SubscriptionName` is the subscription's **display name** as shown in the Azure portal / `descendants` API. Each CSV row applies to exactly one RG in exactly one subscription — no wildcards, no cross-subscription broadcasts.
 
-Rows with an empty `SubscriptionName` are skipped. Missing required columns cause `New-CsvIndex` to throw and fail the run. Duplicate `SubscriptionName` rows silently let the later row win — deduplicate at the source. Extra columns (e.g. `SubscriptionId` kept for humans, `Owner`, `Notes`) are ignored.
+Rows with an empty `SubscriptionName` or `ResourceGroupName` are skipped. Missing required columns cause `New-CsvIndex` to throw and fail the run. Duplicate `(SubscriptionName, ResourceGroupName)` pairs silently let the later row win — deduplicate at the source. Extra columns (e.g. `SubscriptionId` kept for humans, `Owner`, `Notes`) are ignored.
 
 ## Running the pipeline
 
@@ -256,9 +256,10 @@ Queue the pipeline manually and **uncheck `whatIf`** (or set it to `false`). The
 - **`Set-AzContext failed` on a subscription** — the UAMI likely lacks Reader on that subscription, or the subscription is disabled. Fix the role assignment; the script continues past the subscription and prints a warning.
 - **`CSV is missing required column`** — a header was renamed or removed. Fix the CSV; do not edit the script to accept the new name without also updating the [Managed tag keys](./claude.md#managed-tag-keys) section and adding a Change log entry in `claude.md`.
 - **`Verify failed for <RG>`** — the RG was written but the re-read did not observe the expected value. Usually caused by a concurrent tag write from another process. Re-run; if it persists, investigate the other writer.
-- **401/403 from Graph on the site fetch** — the UAMI is missing `Sites.Selected` consent or does not have `read` on the specific site. Re-grant via `POST /sites/{siteId}/permissions`.
-- **Duplicate `SubscriptionName` rows in CSV** — the last row wins (later rows overwrite earlier ones in `$index`). Deduplicate at the source.
+- **401/403 from Graph on the site fetch** — the UAMI is missing `Sites.Selected` consent or does not have `read` on the specific site. Re-grant via `POST /sites/{siteId}/pewritermissions`.
+- **Duplicate `(SubscriptionName, ResourceGroupName)` rows in CSV** — the last row wins (later rows overwrite earlier ones in `$index`). Deduplicate at the source.
 - **Subscription display name changed and CSV wasn't updated** — the subscription silently drops out of scope (logged as `skipped — SubscriptionName '...' not in CSV`). Rename the CSV row to match, or rename the subscription back.
+- **RG renamed and CSV wasn't updated** — the CSV still targets the old name, so both the old CSV row and the new RG go untouched. Fix the CSV to reference the current RG name.
 
 ### Making changes safely
 
