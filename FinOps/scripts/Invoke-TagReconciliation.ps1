@@ -6,7 +6,7 @@
 Reconcile Azure resource-group tags against a CSV stored in SharePoint Online.
 
 .DESCRIPTION
-See CLAUDE.md at the repo root for the spec. Summary:
+Summary:
   - Read the CSV from SharePoint via Microsoft Graph, using the UAMI's OAuth token.
   - Enumerate every subscription under -ManagementGroupId (returns both id and display name).
   - Match by the pair (SubscriptionName, ResourceGroupName), both case-insensitive.

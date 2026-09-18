@@ -2,8 +2,6 @@
 
 Reconcile Azure resource-group tags against a SharePoint-hosted CSV that is the source of truth for four FinOps tag values. An Azure DevOps pipeline runs a PowerShell task on a Microsoft-hosted agent, authenticates as a User-Assigned Managed Identity (UAMI) via a federated service connection, reads the CSV through Microsoft Graph, and merges tag values onto every matching resource group under a target management group.
 
-For the authoritative spec (managed keys, normalization rules, preservation rules, and change log), see [`claude.md`](./claude.md). **Every material change to this solution must be recorded in the Change log in `claude.md`** — this README describes how to run and operate it; the spec lives there.
-
 ## What it does
 
 - Pulls a CSV from SharePoint via Microsoft Graph.
@@ -20,7 +18,6 @@ Subscriptions whose display name is not in the CSV are skipped entirely — the 
 
 ```
 FinOps/
-├── claude.md                              # Spec + change log (authoritative)
 ├── README.md                              # This file — overview and operating notes
 ├── pipelines/
 │   └── azure-pipelines.yml                # ADO pipeline (schedule + task)
@@ -134,7 +131,7 @@ Connect-MgGraph -Scopes `
 Assigns the Graph `Sites.Selected` app role to the UAMI's service principal. Do this once per UAMI.
 
 ```powershell
-$uamiObjectId      = "e1856993-XXXXX"   # principalId of the managed identity
+$uamiObjectId      = "e1856993-XXXXX-ZZZZ"   # principalId of the managed identity
 $graphSp           = Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'"
 $sitesSelectedRole = $graphSp.AppRoles | Where-Object { $_.Value -eq "Sites.Selected" }
 
@@ -167,7 +164,7 @@ $site   = Invoke-MgGraphRequest -Method GET `
   -Uri "https://graph.microsoft.com/v1.0/sites/${sharePointHostname}:${sharePointSitePath}"
 $siteId = $site.id
 $siteId
-# returns: mycloudgurucom.sharepoint.com,3f2504e0-4f89-11d3-9a0c-0305e82c3301,a1b2c3d4-...
+
 ```
 
 The pipeline script does the same lookup at runtime, so the UAMI itself doesn't need this value stored anywhere — it's only used in step 3.
@@ -177,7 +174,7 @@ The pipeline script does the same lookup at runtime, so the UAMI itself doesn't 
 `POST /sites/{siteId}/permissions` gives the UAMI's application the actual per-site access. Without this, `Sites.Selected` alone still returns `403` on every site.
 
 ```powershell
-$uamiClientId = "183dd23f-4b9e-4d8c-abc8-8c184c7a3f44"
+$uamiClientId = "183dd23f-XXXXX-YYYY"
 $uamiName     = "uami-finops-tags"
 
 $body = @{
@@ -254,21 +251,10 @@ Queue the pipeline manually and **uncheck `whatIf`** (or set it to `false`). The
 ### Common failure modes
 
 - **`Set-AzContext failed` on a subscription** — the UAMI likely lacks Reader on that subscription, or the subscription is disabled. Fix the role assignment; the script continues past the subscription and prints a warning.
-- **`CSV is missing required column`** — a header was renamed or removed. Fix the CSV; do not edit the script to accept the new name without also updating the [Managed tag keys](./claude.md#managed-tag-keys) section and adding a Change log entry in `claude.md`.
+- **`CSV is missing required column`** — a header was renamed or removed. Fix the CSV; do not edit the script to accept the new name 
 - **`Verify failed for <RG>`** — the RG was written but the re-read did not observe the expected value. Usually caused by a concurrent tag write from another process. Re-run; if it persists, investigate the other writer.
 - **401/403 from Graph on the site fetch** — the UAMI is missing `Sites.Selected` consent or does not have `read` on the specific site. Re-grant via `POST /sites/{siteId}/pewritermissions`.
 - **Duplicate `(SubscriptionName, ResourceGroupName)` rows in CSV** — the last row wins (later rows overwrite earlier ones in `$index`). Deduplicate at the source.
 - **Subscription display name changed and CSV wasn't updated** — the subscription silently drops out of scope (logged as `skipped — SubscriptionName '...' not in CSV`). Rename the CSV row to match, or rename the subscription back.
 - **RG renamed and CSV wasn't updated** — the CSV still targets the old name, so both the old CSV row and the new RG go untouched. Fix the CSV to reference the current RG name.
 
-### Making changes safely
-
-- Keep the managed-keys list in `$script:ManagedKeys` in `Invoke-TagReconciliation.ps1` and mirror any change in `claude.md`.
-- Never switch `Update-AzTag` to `-Operation Replace` — that would clobber unmanaged tags.
-- Do not add secrets to the variable group. Auth stays on the federated UAMI.
-- After a change, run the pipeline once in dry-run mode before promoting it to a write run.
-- Log the change as a dated entry in the [Change log in `claude.md`](./claude.md#change-log) before merging.
-
-## Support
-
-Owner: FinOps team. For questions about the spec or history, start with `claude.md`. For questions about a specific run, start with the ADO run log — the per-RG output is designed to be greppable by RG name.
