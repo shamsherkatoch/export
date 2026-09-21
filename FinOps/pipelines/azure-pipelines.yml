@@ -36,6 +36,22 @@ jobs:
       - checkout: self
 
       - task: AzurePowerShell@5
+        displayName: Sync-CsvWithAzure.ps1 (append missing RGs)
+        inputs:
+          azureSubscription: $(serviceConnectionName)
+          scriptType: FilePath
+          scriptPath: FinOps/scripts/Sync-CsvWithAzure.ps1
+          scriptArguments: >-
+            -SharePointHostname "$(sharePointHostname)"
+            -SharePointSitePath "$(sharePointSitePath)"
+            -CsvItemPath "$(csvItemPath)"
+            -ManagementGroupId "$(managementGroupId)"
+            -WhatIfMode:$${{ parameters.whatIf }}
+          azurePowerShellVersion: LatestVersion
+          pwsh: true
+          failOnStandardError: true
+
+      - task: AzurePowerShell@5
         displayName: Invoke-TagReconciliation.ps1
         inputs:
           azureSubscription: $(serviceConnectionName)

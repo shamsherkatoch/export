@@ -4,12 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Purpose
 
-Reconcile Azure resource-group tags against a SharePoint-hosted CSV that is treated as the source of truth. An Azure DevOps pipeline runs a PowerShell task on a Microsoft-hosted agent, using a User-Assigned Managed Identity (UAMI) with a federated service connection, to read the CSV via Microsoft Graph and update tag values on every resource group across every subscription under a target management group.
+Reconcile Azure resource-group tags against a SharePoint-hosted CSV that is treated as the source of truth. An Azure DevOps pipeline runs two PowerShell tasks on a Microsoft-hosted agent, using a User-Assigned Managed Identity (UAMI) with a federated service connection. Task 1 discovers any resource groups that exist in Azure but not yet in the CSV and appends a row per missing RG, seeded with the RG's current tag values on the four managed keys (or empty cells if the RG has no such tag). Task 1 never modifies existing CSV rows — humans manually correct any wrong values, and the CSV remains the source of truth. Task 2 reads the (possibly-updated) CSV via Microsoft Graph and updates tag values on every resource group whose `(SubscriptionName, ResourceGroupName)` pair is present in the CSV, across every subscription under a target management group.
 
 ## Repository layout
 
-- `pipelines/azure-pipelines.yml` — Azure DevOps pipeline definition. Scheduled daily at 06:00 UTC, runs on `windows-latest`, invokes the PowerShell script via `AzurePowerShell@5` with the federated service connection. Exposes a `whatIf` boolean parameter (defaults to `true`) so ad-hoc runs are dry-run by default.
-- `scripts/Invoke-TagReconciliation.ps1` — PowerShell 7 script that performs the reconciliation. Requires `Az.Accounts` and `Az.Resources`.
+- `pipelines/azure-pipelines.yml` — Azure DevOps pipeline definition. Scheduled daily at 06:00 UTC, runs on `windows-latest`, invokes two PowerShell scripts via `AzurePowerShell@5` with the federated service connection. Exposes a `whatIf` boolean parameter (defaults to `true`) that is passed to both scripts, so ad-hoc runs are dry-run by default.
+- `scripts/Sync-CsvWithAzure.ps1` — PowerShell 7 script. Enumerates every subscription and RG under the management group, appends missing `(SubscriptionName, ResourceGroupName)` rows to the SharePoint CSV — seeding the four managed tag columns from the RG's current Azure tags (raw, not normalized) or leaving them empty when the RG has no such tag — and PUTs the CSV back via Graph. Existing rows and extra columns are preserved verbatim; this script never rewrites a row that is already in the CSV, so any drift between an existing row's tag values and the RG's actual Azure tags is left for humans to reconcile (task 2 will then push the CSV's value back to Azure). Requires `Az.Accounts` and `Az.Resources`. Runs first in the pipeline.
+- `scripts/Invoke-TagReconciliation.ps1` — PowerShell 7 script that performs the reconciliation. Requires `Az.Accounts` and `Az.Resources`. Runs second.
 - `claude.md` — this file. Spec and change history.
 
 ## Managed tag keys
@@ -73,9 +74,9 @@ Pipeline variables defined directly on the pipeline (**Pipeline → Edit → Var
 
 ## Access the UAMI must hold
 
-- Microsoft Graph permission to read the SharePoint file. `Sites.Selected` scoped to the specific site is the intended grant; the app registration/UAMI must be granted access to the site via `POST /sites/{siteId}/permissions` with role `read` (or `write` if that ever becomes necessary — it does not for this workload).
-- Reader at the target management group — to list subscriptions (`descendants` API) and read RG tags (`Get-AzResourceGroup`).
-- Tag Contributor (or equivalent) at the management group — to write tag values on any RG under it without broader control. `Update-AzTag` with `Operation=Merge` is what the role needs to allow.
+- Microsoft Graph permission to read AND write the SharePoint file. `Sites.Selected` scoped to the specific site is the intended grant; the app registration/UAMI must be granted access to the site via `POST /sites/{siteId}/permissions` with role `write`. Read alone is not enough — `Sync-CsvWithAzure.ps1` needs to PUT the updated CSV back after appending missing RG rows.
+- Reader at the target management group — to list subscriptions (`descendants` API) and read RG tags (`Get-AzResourceGroup`). Both tasks depend on this.
+- Tag Contributor (or equivalent) at the management group — to write tag values on any RG under it without broader control. `Update-AzTag` with `Operation=Merge` is what the role needs to allow. Only task 2 (`Invoke-TagReconciliation.ps1`) needs this.
 
 ## Preservation rules
 
@@ -96,6 +97,12 @@ Pipeline variables defined directly on the pipeline (**Pipeline → Edit → Var
 ## Change log
 
 Newest first. One entry per change. Format: `YYYY-MM-DD — <short summary>`, followed by a short bullet list of what changed and why.
+
+- 2026-09-21 — Add `Sync-CsvWithAzure.ps1` and a second pipeline task to append missing RG rows to the CSV before reconciliation. New rows are seeded from the RG's current Azure tags; existing rows are never modified.
+  - `scripts/Sync-CsvWithAzure.ps1` — new script. Reads the CSV from SharePoint via Graph (capturing the drive item's ETag), enumerates every subscription and RG under `-ManagementGroupId` (this task must inspect every subscription, unlike the reconciliation task which skips subs not in the CSV), diffs against the existing `(SubscriptionName, ResourceGroupName)` pair set, and appends one row per missing pair. New rows populate `SubscriptionName`, `SubscriptionId` (if that column exists), `ResourceGroupName`, and — for each of the four managed tag keys — the RG's current tag value on that key (raw, not normalized) or an empty cell if the RG has no such tag. Seeding from Azure means the CSV reflects the real starting state; a human then manually corrects any wrong values, and task 2 (`Invoke-TagReconciliation.ps1`) propagates the corrected CSV values back to Azure. This script NEVER modifies rows that are already in the CSV — even when an existing row's managed-tag columns have drifted from the RG's actual Azure tags, the row is left alone. The CSV remains the sole source of truth; humans arbitrate corrections. The updated CSV is PUT back with `If-Match: <ETag>` so a concurrent SharePoint edit between GET and PUT fails the run loudly rather than clobbering. `-WhatIfMode:$true` (the default) logs the rows that would be appended but skips the PUT. Column order and unknown extra columns (Owner, Comments, etc.) round-trip verbatim.
+  - `pipelines/azure-pipelines.yml` — added a second `AzurePowerShell@5` step. `Sync-CsvWithAzure.ps1` now runs first, `Invoke-TagReconciliation.ps1` runs second. Both share the same `serviceConnectionName`, SharePoint/CSV/MG variables, and the pipeline's `whatIf` parameter.
+  - Rationale: resource groups created after a CSV snapshot are invisible to reconciliation — task 2 skips any RG whose `(sub, rg)` pair isn't in the CSV. Task 1 closes that gap by surfacing the new RG in the CSV, seeded with whatever tag values the RG currently carries, so ops sees the real starting state and can correct in place.
+  - Spec — the "Purpose", "Repository layout", and "Access the UAMI must hold" sections updated to describe the two-task shape and the `Sites.Selected` grant bumping from `read` to `write` (the PUT-back requires it).
 
 - 2026-09-18 — Warn on rows with missing match keys; normalize current tag value before compare.
   - `scripts/Invoke-TagReconciliation.ps1` — `New-CsvIndex` now emits a `Write-Warning` for each CSV data row that has an empty `SubscriptionName` or `ResourceGroupName` (previously silently `continue`d), and prints a summary count if any rows were skipped. Rows with either match key blank are still ignored — they cannot target an RG unambiguously.
