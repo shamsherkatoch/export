@@ -190,6 +190,9 @@ function Sync-ResourceGroupTags {
         }
     }
 
+    # Returned wrapped in a scalar object, never as a bare collection: PowerShell
+    # unrolls a collection written to the output stream, so a 0- or 1-change RG
+    # would reach the caller as $null or a lone object instead of a list.
     $changes = New-Object System.Collections.Generic.List[object]
     $toUpdate = @{}
     foreach ($k in $Desired.Keys) {
@@ -210,12 +213,12 @@ function Sync-ResourceGroupTags {
 
     if ($toUpdate.Count -eq 0) {
         Write-Host "  [$($ResourceGroup.ResourceGroupName)] no changes"
-        return ,@($changes)
+        return [pscustomobject]@{ Changes = $changes }
     }
 
     if ($WhatIfMode) {
         Write-Host "  [$($ResourceGroup.ResourceGroupName)] WhatIf: would merge $($toUpdate.Count) key(s)"
-        return ,@($changes)
+        return [pscustomobject]@{ Changes = $changes }
     }
 
     $null = Update-AzTag -ResourceId $ResourceGroup.ResourceId -Tag $toUpdate -Operation Merge
@@ -229,7 +232,7 @@ function Sync-ResourceGroupTags {
         }
     }
     Write-Host "  [$($ResourceGroup.ResourceGroupName)] merged $($toUpdate.Count) key(s) OK"
-    return ,@($changes)
+    return [pscustomobject]@{ Changes = $changes }
 }
 
 function Resolve-MailRecipients {
@@ -244,7 +247,7 @@ function Resolve-MailRecipients {
             if ($trimmed) { $out.Add($trimmed) }
         }
     }
-    return ,@($out)
+    return $out
 }
 
 function ConvertTo-HtmlText {
@@ -405,15 +408,15 @@ foreach ($sub in $subs) {
 
         $desired = $rgRules[$rgKey]
 
-        $changes = Sync-ResourceGroupTags -ResourceGroup $rg -Desired $desired -WhatIfMode:$WhatIfMode
+        $sync = Sync-ResourceGroupTags -ResourceGroup $rg -Desired $desired -WhatIfMode:$WhatIfMode
 
         $results.Add([pscustomobject]@{
             SubscriptionName  = $sub.Name
             ResourceGroupName = $rg.ResourceGroupName
-            Changes           = $changes
+            Changes           = $sync.Changes
         })
 
-        if ($changes.Count -gt 0) { $stats.rgsUpdated++ } else { $stats.rgsUnchanged++ }
+        if ($sync.Changes.Count -gt 0) { $stats.rgsUpdated++ } else { $stats.rgsUnchanged++ }
     }
 }
 
@@ -427,7 +430,9 @@ Write-Host ("Summary: subs inspected={0}, matched={1}, skipped={2} | rgs inspect
 # Only reached when the reconciliation above completed without throwing, so the
 # report always describes a successful run.
 
-$recipients = Resolve-MailRecipients -Addresses $MailTo
+# @() at the call site, not a wrapped return: the function's output unrolls, so an
+# empty recipient list has to be re-collected here or $recipients would be $null.
+$recipients = @(Resolve-MailRecipients -Addresses $MailTo)
 
 if ($recipients.Count -eq 0) {
     Write-Host ""
