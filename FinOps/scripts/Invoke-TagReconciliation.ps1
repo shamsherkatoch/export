@@ -353,27 +353,10 @@ function Send-GraphMailReport {
             -Body ([System.Text.Encoding]::UTF8.GetBytes($json))
     } catch {
         # Invoke-RestMethod's message is only "Response status code does not indicate
-        # success: 404 (Not Found)." — the Graph error code and message that say WHY
-        # live in the response body, on $_.ErrorDetails.Message. Print it, or the
-        # failure is undiagnosable from the ADO log.
-        $status = $null
-        if ($_.PSObject.Properties.Name -contains 'Exception' -and
-            $_.Exception.PSObject.Properties.Name -contains 'Response' -and
-            $_.Exception.Response) {
-            $status = [int] $_.Exception.Response.StatusCode
-        }
-        $body = $null
+        # success: 404 (Not Found)." — the Graph error code that says WHY is in the
+        # response body. Print it, or the failure is undiagnosable from the ADO log.
         if ($_.PSObject.Properties.Name -contains 'ErrorDetails' -and $_.ErrorDetails) {
-            $body = $_.ErrorDetails.Message
-        }
-        Write-Host "sendMail failed. status=$status sender='$From'"
-        if ($body) { Write-Host "Graph response: $body" }
-        if ($status -eq 404) {
-            Write-Host "A 404 on sendMail is about the SENDER, not the recipients and not the Mail.Send grant (that fails 403)."
-            Write-Host "  - '$From' must resolve to a user object in THIS tenant — check the domain is one the tenant actually owns."
-            Write-Host "  - That user must have an Exchange Online mailbox. A cloud identity with no mailbox, an unlicensed user,"
-            Write-Host "    a distribution list or a mail-enabled security group all 404 here."
-            Write-Host "  - A shared mailbox is fine; a group is not."
+            Write-Host "Graph sendMail error (sender '$From'): $($_.ErrorDetails.Message)"
         }
         throw
     }
