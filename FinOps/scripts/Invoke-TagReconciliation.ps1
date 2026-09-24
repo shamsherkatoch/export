@@ -61,6 +61,16 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+# ADO surfaces only the exception message, which for .NET overload failures
+# ("Argument types do not match") names neither the line nor the call. Print the
+# position before rethrowing so a failed run is diagnosable from the log alone.
+trap {
+    Write-Host "FAILED: $($_.Exception.Message)"
+    Write-Host "  at line $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line)"
+    Write-Host "  stack: $($_.ScriptStackTrace)"
+    throw
+}
+
 $script:ManagedKeys = @('BusinessUnit', 'CostObject', 'GeneralLedgerCode', 'FinancialDelegate')
 
 function ConvertTo-NormalizedTagValue {
@@ -240,7 +250,9 @@ function Resolve-MailRecipients {
 function ConvertTo-HtmlText {
     param([AllowNull()][string] $Value)
     if ([string]::IsNullOrWhiteSpace($Value)) { return '<span style="color:#888;">(not set)</span>' }
-    return [System.Net.WebUtility]::HtmlEncode($Value)
+    # Plain -replace rather than WebUtility::HtmlEncode — no .NET overload resolution.
+    # '&' must be first or it would double-encode the entities added after it.
+    return ($Value -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;')
 }
 
 function New-ReconciliationHtmlReport {
@@ -260,48 +272,52 @@ function New-ReconciliationHtmlReport {
     $th = 'style="text-align:left;padding:6px 10px;border:1px solid #d0d7de;background:#f3f5f7;font-weight:600;"'
     $td = 'style="text-align:left;padding:6px 10px;border:1px solid #d0d7de;"'
 
-    $sb = New-Object System.Text.StringBuilder
-    $null = $sb.Append('<html><body style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#24292f;">')
-    $null = $sb.Append('<h2 style="margin:0 0 4px 0;">Azure resource-group tag reconciliation</h2>')
-    $null = $sb.Append("<p style=""margin:0 0 16px 0;color:$modeColor;font-weight:600;"">$modeLabel</p>")
+    $runTime = Get-Date -Date ([datetime]::UtcNow) -Format 'yyyy-MM-dd HH:mm:ss'
 
-    $null = $sb.Append('<table style="border-collapse:collapse;margin-bottom:20px;">')
-    $null = $sb.Append("<tr><td $td>Run (UTC)</td><td $td>$([System.DateTime]::UtcNow.ToString('yyyy-MM-dd HH:mm:ss'))</td></tr>")
-    $null = $sb.Append("<tr><td $td>Management group</td><td $td>$(ConvertTo-HtmlText $ManagementGroupId)</td></tr>")
-    $null = $sb.Append("<tr><td $td>CSV source</td><td $td>$(ConvertTo-HtmlText $CsvSource)</td></tr>")
-    $null = $sb.Append('</table>')
+    # Plain string list + -join rather than StringBuilder: Append() has ~30 overloads
+    # and resolving them is a needless failure surface here.
+    $html = New-Object System.Collections.Generic.List[object]
+    $html.Add('<html><body style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#24292f;">')
+    $html.Add('<h2 style="margin:0 0 4px 0;">Azure resource-group tag reconciliation</h2>')
+    $html.Add("<p style=""margin:0 0 16px 0;color:$modeColor;font-weight:600;"">$modeLabel</p>")
 
-    $null = $sb.Append('<h3 style="margin:0 0 8px 0;">Summary</h3>')
-    $null = $sb.Append('<table style="border-collapse:collapse;margin-bottom:20px;">')
-    $null = $sb.Append("<tr><th $th>Metric</th><th $th>Count</th></tr>")
+    $html.Add('<table style="border-collapse:collapse;margin-bottom:20px;">')
+    $html.Add("<tr><td $td>Run (UTC)</td><td $td>$runTime</td></tr>")
+    $html.Add("<tr><td $td>Management group</td><td $td>$(ConvertTo-HtmlText $ManagementGroupId)</td></tr>")
+    $html.Add("<tr><td $td>CSV source</td><td $td>$(ConvertTo-HtmlText $CsvSource)</td></tr>")
+    $html.Add('</table>')
+
+    $html.Add('<h3 style="margin:0 0 8px 0;">Summary</h3>')
+    $html.Add('<table style="border-collapse:collapse;margin-bottom:20px;">')
+    $html.Add("<tr><th $th>Metric</th><th $th>Count</th></tr>")
+    # GetEnumerator, not $Stats[$key] — OrderedDictionary exposes both Item[int]
+    # and Item[object], so indexing it is the ambiguous form, not the safe one.
     foreach ($entry in $Stats.GetEnumerator()) {
-        $null = $sb.Append("<tr><td $td>$(ConvertTo-HtmlText $entry.Key)</td><td $td>$($entry.Value)</td></tr>")
+        $html.Add("<tr><td $td>$(ConvertTo-HtmlText $entry.Key)</td><td $td>$($entry.Value)</td></tr>")
     }
-    $null = $sb.Append('</table>')
+    $html.Add('</table>')
 
-    $null = $sb.Append("<h3 style=""margin:0 0 8px 0;"">$verb ($($changed.Count) resource group(s))</h3>")
+    $html.Add("<h3 style=""margin:0 0 8px 0;"">$verb ($($changed.Count) resource group(s))</h3>")
     if ($changed.Count -eq 0) {
-        $null = $sb.Append('<p>No tag differences found — every matched resource group already agrees with the CSV.</p>')
+        $html.Add('<p>No tag differences found — every matched resource group already agrees with the CSV.</p>')
     } else {
-        $null = $sb.Append('<table style="border-collapse:collapse;">')
-        $null = $sb.Append("<tr><th $th>Subscription</th><th $th>Resource group</th><th $th>Tag key</th><th $th>Current</th><th $th>CSV value</th></tr>")
+        $html.Add('<table style="border-collapse:collapse;">')
+        $html.Add("<tr><th $th>Subscription</th><th $th>Resource group</th><th $th>Tag key</th><th $th>Current</th><th $th>CSV value</th></tr>")
         foreach ($result in $changed) {
             foreach ($change in $result.Changes) {
-                $null = $sb.Append('<tr>')
-                $null = $sb.Append("<td $td>$(ConvertTo-HtmlText $result.SubscriptionName)</td>")
-                $null = $sb.Append("<td $td>$(ConvertTo-HtmlText $result.ResourceGroupName)</td>")
-                $null = $sb.Append("<td $td>$(ConvertTo-HtmlText $change.Key)</td>")
-                $null = $sb.Append("<td $td>$(ConvertTo-HtmlText $change.From)</td>")
-                $null = $sb.Append("<td $td>$(ConvertTo-HtmlText $change.To)</td>")
-                $null = $sb.Append('</tr>')
+                $html.Add("<tr><td $td>$(ConvertTo-HtmlText $result.SubscriptionName)</td>" +
+                          "<td $td>$(ConvertTo-HtmlText $result.ResourceGroupName)</td>" +
+                          "<td $td>$(ConvertTo-HtmlText $change.Key)</td>" +
+                          "<td $td>$(ConvertTo-HtmlText $change.From)</td>" +
+                          "<td $td>$(ConvertTo-HtmlText $change.To)</td></tr>")
             }
         }
-        $null = $sb.Append('</table>')
+        $html.Add('</table>')
     }
 
-    $null = $sb.Append('<p style="margin-top:24px;color:#57606a;font-size:12px;">Generated by Invoke-TagReconciliation.ps1. The SharePoint CSV is the source of truth — correct values there, not in Azure.</p>')
-    $null = $sb.Append('</body></html>')
-    return $sb.ToString()
+    $html.Add('<p style="margin-top:24px;color:#57606a;font-size:12px;">Generated by Invoke-TagReconciliation.ps1. The SharePoint CSV is the source of truth — correct values there, not in Azure.</p>')
+    $html.Add('</body></html>')
+    return ($html -join '')
 }
 
 function Send-GraphMailReport {
