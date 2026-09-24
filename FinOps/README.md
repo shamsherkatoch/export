@@ -243,43 +243,53 @@ As with `Sites.Selected`, assigning an application permission directly to a serv
 
 **Verify**: **Entra ID → Enterprise applications → (the UAMI) → Permissions** should now list both `Sites.Selected` and `Mail.Send` on Microsoft Graph.
 
-##### Step 2 - Scope the grant to the one sender mailbox
+##### Step 2 - Scope the grant to your existing sender mailbox
 
-Restrict the UAMI so it can only send as `mailFrom`. Requires the `ExchangeOnlineManagement` module and an Exchange admin:
+Step 1 left the UAMI able to send as **any** mailbox in the tenant. This step restricts it to the one existing mailbox you want the reports to come from - the value you put in the `mailFrom` pipeline variable.
+
+You do **not** need to create a distribution group or a mail-enabled security group for this. `-PolicyScopeGroupId` accepts any recipient, including a single user or shared mailbox, so point it straight at the mailbox you already have.
+
+Requires the `ExchangeOnlineManagement` module and an Exchange admin:
 
 ```powershell
 Install-Module ExchangeOnlineManagement -Scope CurrentUser
 Connect-ExchangeOnline
 
-# A mail-enabled security group holding just the sender mailbox.
-New-DistributionGroup -Name "sg-finops-report-senders" -Type Security `
-  -Members "finops-reports@contoso.com"
-
-# $uamiClientId is the UAMI clientId, NOT the objectId used for role assignments.
+# The UAMI clientId, NOT the objectId used for role assignments.
 $uamiClientId = "183dd23f-XXXXX-YYYY"
+
+# The existing mailbox the reports send from - same value as the mailFrom variable.
+$senderMailbox = "admin@contoso.com"
 
 New-ApplicationAccessPolicy `
   -AppId              $uamiClientId `
-  -PolicyScopeGroupId "sg-finops-report-senders@contoso.com" `
+  -PolicyScopeGroupId $senderMailbox `
   -AccessRight        RestrictAccess `
   -Description        "Limit FinOps tag pipeline to the report sender mailbox"
 ```
 
-The `AppId` here is the UAMI's **clientId** - the same value used in the `POST /sites/{siteId}/permissions` body in 3b - not the principal/object id used for role assignments. Getting this wrong is the single most common cause of a `403` on `sendMail`, because the policy silently applies to nothing.
+Two things to get right:
 
-Policies take up to ~30 minutes to propagate. Test it once live:
+- **`-AppId` is the UAMI's clientId**, the same value used in the `POST /sites/{siteId}/permissions` body in 3b - not the principal/object id used for role assignments. This is the most common cause of a `403` on `sendMail`, because a policy built on the wrong id silently applies to nothing.
+- **`-PolicyScopeGroupId` must be the mailbox itself**, and `mailFrom` must match it. The policy is an allow-list: anything not in scope is denied.
+
+If you later want reports to be sendable from more than one mailbox, that is when a mail-enabled security group is worth creating - put the mailboxes in it and pass the group here instead. For a single sender it adds an object to maintain and buys nothing.
+
+Policies take up to ~30 minutes to propagate. Test once it is live:
 
 ```powershell
-Test-ApplicationAccessPolicy -Identity "finops-reports@contoso.com" -AppId $uamiClientId
+Test-ApplicationAccessPolicy -Identity $senderMailbox -AppId $uamiClientId
 # AccessCheckResult : Granted
 
 Test-ApplicationAccessPolicy -Identity "someone-else@contoso.com" -AppId $uamiClientId
 # AccessCheckResult : Denied   <- this result is what proves the scoping works
 ```
 
+Run both checks. `Granted` alone only shows the mailbox is reachable; the `Denied` on an unrelated mailbox is what proves the tenant-wide `Mail.Send` grant is actually contained.
+
 ##### Step 3 - Verify end to end
 
-Run the pipeline in dry-run mode. The tail of the log prints `POST https://graph.microsoft.com/v1.0/users/...:/sendMail` followed by `Report sent.`, and the report lands in every `mailTo` inbox. A `403 ErrorAccessDenied` at that step means the app access policy is denying the sender - re-check the `AppId` is the clientId and that `mailFrom` is a member of the scope group.
+Run the pipeline in dry-run mode. The tail of the log prints `POST https://graph.microsoft.com/v1.0/users/...:/sendMail` followed by `Report sent.`, and the report lands in every `mailTo` inbox. A `403 ErrorAccessDenied` at that step means the app access policy is denying the sender - re-check that `-AppId` is the clientId and that `-PolicyScopeGroupId` names the same mailbox as `mailFrom`.
 
 #### 3d. Azure DevOps
 
@@ -348,8 +358,8 @@ All values are HTML-encoded, so a stray `&` or `<` in a tag value cannot break t
 - **Duplicate `(SubscriptionName, ResourceGroupName)` rows in CSV** - the last row wins (later rows overwrite earlier ones in `$index`). Deduplicate at the source.
 - **Subscription display name changed and CSV wasn't updated** - the subscription silently drops out of scope (logged as `skipped - SubscriptionName '...' not in CSV`). Rename the CSV row to match, or rename the subscription back.
 - **RG renamed and CSV wasn't updated** - the CSV still targets the old name, so both the old CSV row and the new RG go untouched. Fix the CSV to reference the current RG name.
-- **`403 ErrorAccessDenied` on `sendMail`** - the Exchange application access policy is blocking the sender. Confirm `New-ApplicationAccessPolicy` was created with the UAMI's **clientId** (not its objectId) and that `mailFrom` is in the scope group: `Test-ApplicationAccessPolicy -Identity <mailFrom> -AppId <clientId>` must return `Granted`. Allow ~30 minutes after creating or editing a policy.
-- **`404 ResourceNotFound` on `sendMail`** - `mailFrom` isn't a mailbox Graph can resolve. It must be a licensed user or shared mailbox, not a distribution list or mail-enabled security group.
+- **`403 ErrorAccessDenied` on `sendMail`** - the Exchange application access policy is blocking the sender. Confirm `New-ApplicationAccessPolicy` was created with the UAMI's **clientId** (not its objectId) and that `-PolicyScopeGroupId` names the same mailbox as `mailFrom`: `Test-ApplicationAccessPolicy -Identity <mailFrom> -AppId <clientId>` must return `Granted`. Allow ~30 minutes after creating or editing a policy.
+- **`404 (Not Found)` on `sendMail`** - always about the **sender**, never the recipients and never the `Mail.Send` grant (a missing grant fails 403). `mailFrom` must (a) resolve to a user object in this tenant - check the domain is one the tenant actually owns, not a lookalike - and (b) have an Exchange Online mailbox. An unlicensed user, a cloud identity with no mailbox, a distribution list and a mail-enabled security group all 404. A shared mailbox is fine. The script prints the Graph error body (`ErrorInvalidUser`, `MailboxNotEnabledForRESTAPI`, `Resource not found for the segment 'users'`) next to the failure; check `Get-Mailbox <mailFrom>` in Exchange Online to confirm the mailbox exists.
 - **`401`/`403` immediately on `sendMail` but SharePoint worked** - `Mail.Send` was never granted, only `Sites.Selected`. Re-run step 1 of section 3c; the two grants are independent.
 - **Run succeeded but no email arrived** - check whether the log says `Email report skipped - no MailTo recipients configured`; that means the `mailTo` pipeline variable is empty or missing. Otherwise check the recipients' junk folders, since the sending mailbox is likely new.
 - **`MailTo was supplied but MailFrom is empty`** - the `mailFrom` pipeline variable is unset. Graph app-only send has no default sender mailbox; set it explicitly.

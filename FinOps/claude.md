@@ -103,6 +103,18 @@ Pipeline variables defined directly on the pipeline (**Pipeline → Edit → Var
 
 Newest first. One entry per change. Format: `YYYY-MM-DD — <short summary>`, followed by a short bullet list of what changed and why.
 
+- 2026-09-25 — Surface the Graph error body when `sendMail` fails.
+  - Symptom: a dry run ended with `FAILED: Response status code does not indicate success: 404 (Not Found).` and nothing else. That text is all `Invoke-RestMethod` puts on the exception; the Graph error code and message that explain the 404 are in the **response body**, which was being discarded.
+  - `scripts/Invoke-TagReconciliation.ps1` — `Send-GraphMailReport` now wraps the POST in try/catch, prints the HTTP status, the sender it used, and `$_.ErrorDetails.Message` (the Graph JSON error), then rethrows so the task still fails. On a 404 it also prints the three things that actually cause one, because the message alone reads like a bad URL.
+  - A 404 from `POST /users/{id}/sendMail` is always about the **sender**: either `mailFrom` doesn't resolve to a user object in the tenant (wrong or unowned domain), or it resolves but has no Exchange Online mailbox (unlicensed user, distribution list, mail-enabled security group). It is never the recipients, and it is never a missing `Mail.Send` grant or an application access policy — those fail 403, not 404.
+  - Property access is probed with `PSObject.Properties.Name -contains` before reading, since `Set-StrictMode -Version Latest` throws on an absent property and an error record raised inside a catch block would mask the real failure.
+  - `README.md` — the `404 ... sendMail` failure mode rewritten from one line about distribution lists into the full sender checklist, with the Graph error codes to look for and `Get-Mailbox` as the confirmation step.
+
+- 2026-09-24 — README 3c step 2: scope the `Mail.Send` policy to the existing sender mailbox, no group.
+  - `README.md` — dropped the `New-DistributionGroup` call. `New-ApplicationAccessPolicy -PolicyScopeGroupId` takes any recipient, including a single user or shared mailbox, so it now points straight at the existing `mailFrom` mailbox. Creating a mail-enabled security group for one sender added an object to maintain and bought nothing; the group form is kept as a one-line note for the case where several mailboxes need to send.
+  - The two `Test-ApplicationAccessPolicy` checks are now called out as both being required: `Granted` on the sender only shows it is reachable, while `Denied` on an unrelated mailbox is what proves the tenant-wide `Mail.Send` grant is actually contained.
+  - Step 3 and the `403 ErrorAccessDenied` failure mode reworded off "member of the scope group" onto "`-PolicyScopeGroupId` names the same mailbox as `mailFrom`".
+
 - 2026-09-24 — Fix `Argument types do not match` in `Sync-ResourceGroupTags`; stop returning bare collections from functions.
   - Symptom: the reconciliation task exited 1 with only `##[error]Argument types do not match` and no position. `Sync-CsvWithAzure.ps1`, which shares the token/Graph/CSV code, ran clean, so the fault was in code unique to the reconciliation script.
   - Root cause: `return ,@($changes)` — the unary-comma-wrapped array subexpression added when `Sync-ResourceGroupTags` started returning its change list. `"Argument types do not match"` is what `System.Array.SetValue` throws on an element-type mismatch, and that line is the only array construction in the frame. It fired on the first RG that needed no changes, i.e. on an **empty** `List[object]`.

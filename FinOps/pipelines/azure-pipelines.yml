@@ -25,7 +25,7 @@ variables:
   csvItemPath: "poc/tags.csv"
   managementGroupId: "MCGAU"
   # Report email. mailTo accepts several addresses separated by ';' or ','.
-  mailFrom: "admin@mycloudgurucom.com"
+  mailFrom: "admin@mycloudguru.com"
   mailTo: "shamsher.katoch@gmail.com"
   mailSubject: "Azure RG tag reconciliation"
 
