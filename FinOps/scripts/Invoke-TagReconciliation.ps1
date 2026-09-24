@@ -17,6 +17,8 @@ Summary:
   - Values are trimmed of all whitespace and uppercased before compare/write.
   - Only keys whose current tag value differs from the CSV value are written.
   - Writes MERGE — tags outside the four managed keys are never touched.
+  - After a successful run, render an HTML report and mail it via Microsoft Graph
+    (POST /users/{MailFrom}/sendMail) using the same UAMI token.
 
 .PARAMETER SharePointHostname
 Tenant hostname, e.g. "contoso.sharepoint.com".
@@ -32,6 +34,16 @@ Management group name (not display name) whose subscription tree to reconcile.
 
 .PARAMETER WhatIfMode
 When $true (default), log intended changes but do not write.
+
+.PARAMETER MailFrom
+UPN or object id of the mailbox the report is sent from. Required to send mail.
+
+.PARAMETER MailTo
+One or more recipient addresses. Accepts an array, or a single string holding
+several addresses separated by ';' or ','. Empty disables the report.
+
+.PARAMETER MailSubject
+Subject line base. The run mode and change count are appended to it.
 #>
 
 [CmdletBinding()]
@@ -40,7 +52,10 @@ param(
     [Parameter(Mandatory)] [string] $SharePointSitePath,
     [Parameter(Mandatory)] [string] $CsvItemPath,
     [Parameter(Mandatory)] [string] $ManagementGroupId,
-    [Parameter()]          [bool]   $WhatIfMode = $true
+    [Parameter()]          [bool]   $WhatIfMode = $true,
+    [Parameter()]          [string] $MailFrom,
+    [Parameter()]          [string[]] $MailTo = @(),
+    [Parameter()]          [string] $MailSubject = 'Azure RG tag reconciliation'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -165,6 +180,7 @@ function Sync-ResourceGroupTags {
         }
     }
 
+    $changes = New-Object System.Collections.Generic.List[object]
     $toUpdate = @{}
     foreach ($k in $Desired.Keys) {
         $curVal = $current[$k]
@@ -175,6 +191,7 @@ function Sync-ResourceGroupTags {
         $curNormalized = ConvertTo-NormalizedTagValue -Value $curVal
         if ($curNormalized -ne $Desired[$k]) {
             $toUpdate[$k] = $Desired[$k]
+            $changes.Add([pscustomobject]@{ Key = $k; From = $curVal; To = $Desired[$k] })
             Write-Host "  [$($ResourceGroup.ResourceGroupName)] $k : '$curVal' -> '$($Desired[$k])'"
         } else {
             Write-Host "  [$($ResourceGroup.ResourceGroupName)] $k : match ('$curVal')"
@@ -183,12 +200,12 @@ function Sync-ResourceGroupTags {
 
     if ($toUpdate.Count -eq 0) {
         Write-Host "  [$($ResourceGroup.ResourceGroupName)] no changes"
-        return
+        return ,@($changes)
     }
 
     if ($WhatIfMode) {
         Write-Host "  [$($ResourceGroup.ResourceGroupName)] WhatIf: would merge $($toUpdate.Count) key(s)"
-        return
+        return ,@($changes)
     }
 
     $null = Update-AzTag -ResourceId $ResourceGroup.ResourceId -Tag $toUpdate -Operation Merge
@@ -202,11 +219,124 @@ function Sync-ResourceGroupTags {
         }
     }
     Write-Host "  [$($ResourceGroup.ResourceGroupName)] merged $($toUpdate.Count) key(s) OK"
+    return ,@($changes)
+}
+
+function Resolve-MailRecipients {
+    param([AllowNull()][string[]] $Addresses)
+    # The pipeline passes To as one string; a caller may pass an array. Accept both,
+    # and split on ';' or ',' so "a@x.com; b@y.com" works from a single ADO variable.
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach ($entry in @($Addresses)) {
+        if ([string]::IsNullOrWhiteSpace($entry)) { continue }
+        foreach ($part in ($entry -split '[;,]')) {
+            $trimmed = $part.Trim()
+            if ($trimmed) { $out.Add($trimmed) }
+        }
+    }
+    return ,@($out)
+}
+
+function ConvertTo-HtmlText {
+    param([AllowNull()][string] $Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '<span style="color:#888;">(not set)</span>' }
+    return [System.Net.WebUtility]::HtmlEncode($Value)
+}
+
+function New-ReconciliationHtmlReport {
+    param(
+        [Parameter(Mandatory)] $Stats,
+        [Parameter()][AllowEmptyCollection()][object[]] $Results = @(),
+        [Parameter(Mandatory)][bool] $WhatIfMode,
+        [Parameter(Mandatory)][string] $ManagementGroupId,
+        [Parameter(Mandatory)][string] $CsvSource
+    )
+
+    $modeLabel = if ($WhatIfMode) { 'DRY RUN — no tags were written' } else { 'LIVE — tags were merged' }
+    $modeColor = if ($WhatIfMode) { '#8a6d00' } else { '#0b6b34' }
+    $changed   = @($Results | Where-Object { $_.Changes.Count -gt 0 })
+    $verb      = if ($WhatIfMode) { 'Would change' } else { 'Changed' }
+
+    $th = 'style="text-align:left;padding:6px 10px;border:1px solid #d0d7de;background:#f3f5f7;font-weight:600;"'
+    $td = 'style="text-align:left;padding:6px 10px;border:1px solid #d0d7de;"'
+
+    $sb = New-Object System.Text.StringBuilder
+    $null = $sb.Append('<html><body style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#24292f;">')
+    $null = $sb.Append('<h2 style="margin:0 0 4px 0;">Azure resource-group tag reconciliation</h2>')
+    $null = $sb.Append("<p style=""margin:0 0 16px 0;color:$modeColor;font-weight:600;"">$modeLabel</p>")
+
+    $null = $sb.Append('<table style="border-collapse:collapse;margin-bottom:20px;">')
+    $null = $sb.Append("<tr><td $td>Run (UTC)</td><td $td>$([System.DateTime]::UtcNow.ToString('yyyy-MM-dd HH:mm:ss'))</td></tr>")
+    $null = $sb.Append("<tr><td $td>Management group</td><td $td>$(ConvertTo-HtmlText $ManagementGroupId)</td></tr>")
+    $null = $sb.Append("<tr><td $td>CSV source</td><td $td>$(ConvertTo-HtmlText $CsvSource)</td></tr>")
+    $null = $sb.Append('</table>')
+
+    $null = $sb.Append('<h3 style="margin:0 0 8px 0;">Summary</h3>')
+    $null = $sb.Append('<table style="border-collapse:collapse;margin-bottom:20px;">')
+    $null = $sb.Append("<tr><th $th>Metric</th><th $th>Count</th></tr>")
+    foreach ($entry in $Stats.GetEnumerator()) {
+        $null = $sb.Append("<tr><td $td>$(ConvertTo-HtmlText $entry.Key)</td><td $td>$($entry.Value)</td></tr>")
+    }
+    $null = $sb.Append('</table>')
+
+    $null = $sb.Append("<h3 style=""margin:0 0 8px 0;"">$verb ($($changed.Count) resource group(s))</h3>")
+    if ($changed.Count -eq 0) {
+        $null = $sb.Append('<p>No tag differences found — every matched resource group already agrees with the CSV.</p>')
+    } else {
+        $null = $sb.Append('<table style="border-collapse:collapse;">')
+        $null = $sb.Append("<tr><th $th>Subscription</th><th $th>Resource group</th><th $th>Tag key</th><th $th>Current</th><th $th>CSV value</th></tr>")
+        foreach ($result in $changed) {
+            foreach ($change in $result.Changes) {
+                $null = $sb.Append('<tr>')
+                $null = $sb.Append("<td $td>$(ConvertTo-HtmlText $result.SubscriptionName)</td>")
+                $null = $sb.Append("<td $td>$(ConvertTo-HtmlText $result.ResourceGroupName)</td>")
+                $null = $sb.Append("<td $td>$(ConvertTo-HtmlText $change.Key)</td>")
+                $null = $sb.Append("<td $td>$(ConvertTo-HtmlText $change.From)</td>")
+                $null = $sb.Append("<td $td>$(ConvertTo-HtmlText $change.To)</td>")
+                $null = $sb.Append('</tr>')
+            }
+        }
+        $null = $sb.Append('</table>')
+    }
+
+    $null = $sb.Append('<p style="margin-top:24px;color:#57606a;font-size:12px;">Generated by Invoke-TagReconciliation.ps1. The SharePoint CSV is the source of truth — correct values there, not in Azure.</p>')
+    $null = $sb.Append('</body></html>')
+    return $sb.ToString()
+}
+
+function Send-GraphMailReport {
+    param(
+        [Parameter(Mandatory)][string] $From,
+        [Parameter(Mandatory)][string[]] $To,
+        [Parameter(Mandatory)][string] $Subject,
+        [Parameter(Mandatory)][string] $HtmlBody
+    )
+
+    $token = Get-AccessTokenPlain -ResourceUrl 'https://graph.microsoft.com'
+    $uri = "https://graph.microsoft.com/v1.0/users/$([System.Uri]::EscapeDataString($From))/sendMail"
+
+    $payload = @{
+        message = @{
+            subject      = $Subject
+            body         = @{ contentType = 'HTML'; content = $HtmlBody }
+            toRecipients = @($To | ForEach-Object { @{ emailAddress = @{ address = $_ } } })
+        }
+        saveToSentItems = $false
+    }
+
+    $json = $payload | ConvertTo-Json -Depth 6 -Compress
+    Write-Host "POST $uri"
+    # sendMail returns 202 with an empty body; swallow it so nothing leaks to the pipeline.
+    $null = Invoke-RestMethod -Method POST -Uri $uri `
+        -Headers @{ Authorization = "Bearer $token" } `
+        -ContentType 'application/json; charset=utf-8' `
+        -Body ([System.Text.Encoding]::UTF8.GetBytes($json))
 }
 
 # --- main --------------------------------------------------------------------
 
-Write-Host "Reading CSV from SharePoint: https://$SharePointHostname$SharePointSitePath/$CsvItemPath"
+$csvSource = "https://$SharePointHostname$SharePointSitePath/$CsvItemPath"
+Write-Host "Reading CSV from SharePoint: $csvSource"
 $rows = Get-CsvFromSharePoint -Hostname $SharePointHostname -SitePath $SharePointSitePath -ItemPath $CsvItemPath
 Write-Host "CSV rows: $($rows.Count)"
 
@@ -226,6 +356,8 @@ $stats = [ordered]@{
     rgsUpdated    = 0
     rgsUnchanged  = 0
 }
+
+$results = New-Object System.Collections.Generic.List[object]
 
 foreach ($sub in $subs) {
     $stats.subsInspected++
@@ -257,16 +389,15 @@ foreach ($sub in $subs) {
 
         $desired = $rgRules[$rgKey]
 
-        $before = @{}
-        if ($rg.Tags) { foreach ($e in $rg.Tags.GetEnumerator()) { $before[$e.Key] = $e.Value } }
+        $changes = Sync-ResourceGroupTags -ResourceGroup $rg -Desired $desired -WhatIfMode:$WhatIfMode
 
-        Sync-ResourceGroupTags -ResourceGroup $rg -Desired $desired -WhatIfMode:$WhatIfMode
+        $results.Add([pscustomobject]@{
+            SubscriptionName  = $sub.Name
+            ResourceGroupName = $rg.ResourceGroupName
+            Changes           = $changes
+        })
 
-        $changed = $false
-        foreach ($k in $desired.Keys) {
-            if ($before[$k] -ne $desired[$k]) { $changed = $true; break }
-        }
-        if ($changed) { $stats.rgsUpdated++ } else { $stats.rgsUnchanged++ }
+        if ($changes.Count -gt 0) { $stats.rgsUpdated++ } else { $stats.rgsUnchanged++ }
     }
 }
 
@@ -275,3 +406,33 @@ Write-Host "Done. WhatIfMode=$WhatIfMode"
 Write-Host ("Summary: subs inspected={0}, matched={1}, skipped={2} | rgs inspected={3}, matched={4}, updated={5}, unchanged={6}" -f `
     $stats.subsInspected, $stats.subsMatched, $stats.subsSkipped, `
     $stats.rgsInspected, $stats.rgsMatched, $stats.rgsUpdated, $stats.rgsUnchanged)
+
+# --- HTML report --------------------------------------------------------------
+# Only reached when the reconciliation above completed without throwing, so the
+# report always describes a successful run.
+
+$recipients = Resolve-MailRecipients -Addresses $MailTo
+
+if ($recipients.Count -eq 0) {
+    Write-Host ""
+    Write-Host "Email report skipped — no MailTo recipients configured."
+    return
+}
+if ([string]::IsNullOrWhiteSpace($MailFrom)) {
+    throw "MailTo was supplied but MailFrom is empty. Graph app-only sendMail needs a sender mailbox (UPN or object id)."
+}
+
+$html = New-ReconciliationHtmlReport `
+    -Stats $stats `
+    -Results $results `
+    -WhatIfMode $WhatIfMode `
+    -ManagementGroupId $ManagementGroupId `
+    -CsvSource $csvSource
+
+$modeTag = if ($WhatIfMode) { 'DRY RUN' } else { 'LIVE' }
+$subject = "{0} - {1} - {2} RG(s) changed" -f $MailSubject, $modeTag, $stats.rgsUpdated
+
+Write-Host ""
+Write-Host "Sending report to $($recipients.Count) recipient(s): $($recipients -join ', ')"
+Send-GraphMailReport -From $MailFrom -To $recipients -Subject $subject -HtmlBody $html
+Write-Host "Report sent."

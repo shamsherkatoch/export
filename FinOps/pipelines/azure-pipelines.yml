@@ -24,6 +24,10 @@ variables:
   sharePointSitePath: "/sites/mycloudguru"
   csvItemPath: "poc/tags.csv"
   managementGroupId: "MCGAU"
+  # Report email. mailTo accepts several addresses separated by ';' or ','.
+  mailFrom: "finops-reports@mycloudgurucom.onmicrosoft.com"
+  mailTo: "finops@mycloudgurucom.onmicrosoft.com"
+  mailSubject: "Azure RG tag reconciliation"
 
 pool:
   vmImage: windows-latest
@@ -52,7 +56,7 @@ jobs:
           failOnStandardError: true
 
       - task: AzurePowerShell@5
-        displayName: Invoke-TagReconciliation.ps1
+        displayName: Invoke-TagReconciliation.ps1 (reconcile + email report)
         inputs:
           azureSubscription: $(serviceConnectionName)
           scriptType: FilePath
@@ -63,6 +67,9 @@ jobs:
             -CsvItemPath "$(csvItemPath)"
             -ManagementGroupId "$(managementGroupId)"
             -WhatIfMode:$${{ parameters.whatIf }}
+            -MailFrom "$(mailFrom)"
+            -MailTo "$(mailTo)"
+            -MailSubject "$(mailSubject)"
           azurePowerShellVersion: LatestVersion
           pwsh: true
           failOnStandardError: true
