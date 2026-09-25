@@ -103,6 +103,13 @@ Pipeline variables defined directly on the pipeline (**Pipeline → Edit → Var
 
 Newest first. One entry per change. Format: `YYYY-MM-DD — <short summary>`, followed by a short bullet list of what changed and why.
 
+- 2026-09-25 — Fix `Argument types do not match` in `Sync-CsvWithAzure.ps1` when new RGs are appended.
+  - Symptom: the sync task failed with only `##[error]Argument types do not match` whenever Azure had an RG not yet in the CSV and `whatIf` was `false`. Runs with nothing to append, or in WhatIf mode, returned before the failing line and passed.
+  - Root cause: `$combined = @($csv.Rows) + @($newRows)` — array `+` where one operand comes from a `List[object]`. Reproduced in isolation on pwsh 7.x with mocked Azure/Graph calls.
+  - Fix: existing rows and new rows are now added to a single `List[object]`, which is piped to `ConvertTo-Csv` as before. Output CSV (header order, extra columns, new rows) verified unchanged against the mocked run.
+  - Convention (extends the 2026-09-24 entry): don't concatenate collections with `+` in these scripts; add to a `List` instead.
+  - Confirmed on 2026-09-25: a live pipeline run appended the new Azure RG to the SharePoint CSV.
+
 - 2026-09-25 — Surface the Graph error body when `sendMail` fails.
   - Symptom: a dry run ended with `FAILED: Response status code does not indicate success: 404 (Not Found).` and nothing else. That text is all `Invoke-RestMethod` puts on the exception; the Graph error code and message that explain the 404 are in the **response body**, which was being discarded.
   - `scripts/Invoke-TagReconciliation.ps1` — `Send-GraphMailReport` now wraps the POST in try/catch, prints the HTTP status, the sender it used, and `$_.ErrorDetails.Message` (the Graph JSON error), then rethrows so the task still fails. On a 404 it also prints the three things that actually cause one, because the message alone reads like a bad URL.

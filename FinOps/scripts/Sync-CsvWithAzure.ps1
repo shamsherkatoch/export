@@ -272,7 +272,11 @@ if ($WhatIfMode) {
 # ConvertTo-Csv emits the header from the first object's property order, which
 # for both existing rows (as read by ConvertFrom-Csv) and the new rows (built
 # via [ordered] against $existingColumns) is the CSV's original column order.
-$combined = @($csv.Rows) + @($newRows)
+# Collected into a List rather than `@($csv.Rows) + @($newRows)`: array `+` with a
+# List[object] operand throws "Argument types do not match". Don't revert it.
+$combined = New-Object System.Collections.Generic.List[object]
+foreach ($r in $csv.Rows) { $combined.Add($r) }
+foreach ($r in $newRows)  { $combined.Add($r) }
 $csvText  = ($combined | ConvertTo-Csv -NoTypeInformation) -join "`r`n"
 
 Set-SharePointCsv -SiteId $csv.SiteId -EncodedPath $csv.EncodedPath -ETag $csv.ETag -Content $csvText
