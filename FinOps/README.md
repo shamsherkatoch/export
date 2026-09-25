@@ -183,10 +183,10 @@ The pipeline script does the same lookup at runtime, so the UAMI itself doesn't 
 
 ```powershell
 $uamiClientId = "183dd23f-XXXXX-YYYY"
-$uamiName     = "uami-finops-tags"
+$uamiName     = "uami-finops"
 
 $body = @{
-  roles               = @("read")
+  roles               = @("read","write")
   grantedToIdentities = @(
     @{ application = @{ id = $uamiClientId; displayName = $uamiName } }
   )

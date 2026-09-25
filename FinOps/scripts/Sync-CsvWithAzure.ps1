@@ -12,17 +12,17 @@ the four managed keys (so humans see reality and can correct as needed).
   - Read the CSV from SharePoint via Microsoft Graph and capture the drive item's ETag.
   - Enumerate every subscription under -ManagementGroupId, then Set-AzContext +
     Get-AzResourceGroup in each to build the actual (sub, RG) set. Unlike the
-    reconciliation task, this one has to look at every subscription — the whole
+    reconciliation task, this one has to look at every subscription - the whole
     point is to discover ones not yet in the CSV.
   - Compute the pairs that are in Azure but not the CSV.
   - Append one row per missing pair, populating SubscriptionName, SubscriptionId
-    (if that column exists), ResourceGroupName, and — for each of the four managed
-    tag keys — the RG's current tag value on that key (raw, as stored in Azure)
+    (if that column exists), ResourceGroupName, and - for each of the four managed
+    tag keys - the RG's current tag value on that key (raw, as stored in Azure)
     or an empty cell if the RG has no such tag. Seeding from the RG rather than
     leaving blank means the CSV reflects the real starting state; humans then
     manually correct any values that are wrong, and reconciliation propagates
     those corrections back to Azure.
-  - Existing rows are preserved verbatim — this script never rewrites a row that
+  - Existing rows are preserved verbatim - this script never rewrites a row that
     is already in the CSV, and never touches the four managed tag columns on
     existing rows even if the RG's Azure tags have drifted. Only the reconciliation
     task writes to Azure, and only from the human-curated CSV.
@@ -149,7 +149,7 @@ function Get-SubscriptionsUnderManagementGroup {
 function Get-ExistingPairSet {
     # Nested hashtable: $set[<subName lower>][<rgName lower>] = $true.
     # Rows with either match key blank cannot claim a pair unambiguously, so they
-    # are ignored — the reconciliation task warns about them separately.
+    # are ignored - the reconciliation task warns about them separately.
     param([object[]] $Rows)
     $set = @{}
     foreach ($row in $Rows) {
@@ -169,7 +169,7 @@ $csv = Get-SharePointCsv -Hostname $SharePointHostname -SitePath $SharePointSite
 Write-Host "CSV rows: $($csv.Rows.Count); ETag: $($csv.ETag)"
 
 if ($csv.Rows.Count -eq 0) {
-    throw "CSV is empty — cannot infer column order. Populate it with at least a header row before running this task."
+    throw "CSV is empty - cannot infer column order. Populate it with at least a header row before running this task."
 }
 
 $existingColumns = @($csv.Rows[0].PSObject.Properties.Name)
@@ -204,7 +204,7 @@ foreach ($sub in $subs) {
     try {
         $null = Set-AzContext -SubscriptionId $sub.Id -WarningAction SilentlyContinue
     } catch {
-        Write-Warning "Skipping $($sub.Name) ($($sub.Id)) — Set-AzContext failed: $($_.Exception.Message)"
+        Write-Warning "Skipping $($sub.Name) ($($sub.Id)) - Set-AzContext failed: $($_.Exception.Message)"
         $stats.subsFailed++
         continue
     }
@@ -260,7 +260,7 @@ Write-Host ("Summary: subs inspected={0}, failed={1} | rgs inspected={2}, alread
     $stats.subsInspected, $stats.subsFailed, $stats.rgsInspected, $stats.rgsAlready, $stats.rgsToAppend)
 
 if ($newRows.Count -eq 0) {
-    Write-Host "No new rows — CSV is already in sync. Nothing to upload."
+    Write-Host "No new rows - CSV is already in sync. Nothing to upload."
     return
 }
 
