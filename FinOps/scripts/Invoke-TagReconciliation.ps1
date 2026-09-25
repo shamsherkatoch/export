@@ -262,15 +262,12 @@ function New-ReconciliationHtmlReport {
     param(
         [Parameter(Mandatory)] $Stats,
         [Parameter()][AllowEmptyCollection()][object[]] $Results = @(),
-        [Parameter(Mandatory)][bool] $WhatIfMode,
         [Parameter(Mandatory)][string] $ManagementGroupId,
         [Parameter(Mandatory)][string] $CsvSource
     )
 
-    $modeLabel = if ($WhatIfMode) { 'DRY RUN - no tags were written' } else { 'LIVE - tags were merged' }
-    $modeColor = if ($WhatIfMode) { '#8a6d00' } else { '#0b6b34' }
-    $changed   = @($Results | Where-Object { $_.Changes.Count -gt 0 })
-    $verb      = if ($WhatIfMode) { 'Would change' } else { 'Changed' }
+    # Only live runs reach the mail step, so the report always describes written changes.
+    $changed = @($Results | Where-Object { $_.Changes.Count -gt 0 })
 
     $th = 'style="text-align:left;padding:6px 10px;border:1px solid #d0d7de;background:#f3f5f7;font-weight:600;"'
     $td = 'style="text-align:left;padding:6px 10px;border:1px solid #d0d7de;"'
@@ -282,7 +279,7 @@ function New-ReconciliationHtmlReport {
     $html = New-Object System.Collections.Generic.List[object]
     $html.Add('<html><body style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#24292f;">')
     $html.Add('<h2 style="margin:0 0 4px 0;">Azure resource-group tag reconciliation</h2>')
-    $html.Add("<p style=""margin:0 0 16px 0;color:$modeColor;font-weight:600;"">$modeLabel</p>")
+    $html.Add('<p style="margin:0 0 16px 0;color:#0b6b34;font-weight:600;">LIVE - tags were merged</p>')
 
     $html.Add('<table style="border-collapse:collapse;margin-bottom:20px;">')
     $html.Add("<tr><td $td>Run (UTC)</td><td $td>$runTime</td></tr>")
@@ -300,7 +297,7 @@ function New-ReconciliationHtmlReport {
     }
     $html.Add('</table>')
 
-    $html.Add("<h3 style=""margin:0 0 8px 0;"">$verb ($($changed.Count) resource group(s))</h3>")
+    $html.Add("<h3 style=""margin:0 0 8px 0;"">Changed ($($changed.Count) resource group(s))</h3>")
     if ($changed.Count -eq 0) {
         $html.Add('<p>No tag differences found - every matched resource group already agrees with the CSV.</p>')
     } else {
@@ -463,12 +460,11 @@ if ([string]::IsNullOrWhiteSpace($MailFrom)) {
 $html = New-ReconciliationHtmlReport `
     -Stats $stats `
     -Results $results `
-    -WhatIfMode $WhatIfMode `
     -ManagementGroupId $ManagementGroupId `
     -CsvSource $csvSource
 
-$modeTag = if ($WhatIfMode) { 'DRY RUN' } else { 'LIVE' }
-$subject = "{0} - {1} - {2} RG(s) changed" -f $MailSubject, $modeTag, $stats.rgsUpdated
+# "LIVE" stays in the subject so existing inbox rules keyed on it keep matching.
+$subject = "{0} - LIVE - {1} RG(s) changed" -f $MailSubject, $stats.rgsUpdated
 
 Write-Host ""
 Write-Host "Sending report to $($recipients.Count) recipient(s): $($recipients -join ', ')"

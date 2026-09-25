@@ -336,10 +336,10 @@ Queue the pipeline manually and **uncheck `whatIf`** (or set it to `false`). The
 
 Sent on every successful **live** run (`whatIf = false`). Dry runs, including the daily schedule, send nothing. It contains:
 
-- **Header** - `DRY RUN - no tags were written` (amber) or `LIVE - tags were merged` (green).
+- **Header** - `LIVE - tags were merged` (green).
 - **Run metadata** - UTC timestamp, management group, CSV source URL.
 - **Summary** - the same seven counters printed in the log.
-- **Changes table** - one row per changed tag key: subscription, resource group, tag key, current Azure value, CSV value. In dry-run mode the heading reads `Would change (n resource group(s))`. Tags with no current value show `(not set)`. If nothing differs, the table is replaced with a single "No tag differences found" line.
+- **Changes table** - one row per changed tag key: subscription, resource group, tag key, current Azure value, CSV value. The heading reads `Changed (n resource group(s))`. Tags with no current value show `(not set)`. If nothing differs, the table is replaced with a single "No tag differences found" line.
 
 All values are HTML-encoded, so a stray `&` or `<` in a tag value cannot break the layout.
 

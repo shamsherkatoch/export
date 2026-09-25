@@ -74,7 +74,7 @@ Pipeline variables defined directly on the pipeline (**Pipeline → Edit → Var
 - `managementGroupId` — management group **name** (not display name).
 - `mailFrom` — sender mailbox (UPN or object id) for the HTML report. Must be a real Exchange Online mailbox, not a distribution list.
 - `mailTo` — report recipients. One string holding one or more addresses separated by `;` or `,`; `Resolve-MailRecipients` splits and trims them. Empty disables the report.
-- `mailSubject` — subject base. The script appends ` - <DRY RUN|LIVE> - <n> RG(s) changed`.
+- `mailSubject` — subject base. The script appends ` - LIVE - <n> RG(s) changed`; no mail is sent on dry runs.
 
 ## Access the UAMI must hold
 
@@ -102,6 +102,11 @@ Pipeline variables defined directly on the pipeline (**Pipeline → Edit → Var
 ## Change log
 
 Newest first. One entry per change. Format: `YYYY-MM-DD — <short summary>`, followed by a short bullet list of what changed and why.
+
+- 2026-09-25 — Remove the unreachable dry-run wording from the email report.
+  - `scripts/Invoke-TagReconciliation.ps1` — `New-ReconciliationHtmlReport` no longer takes `-WhatIfMode`; the header is always `LIVE - tags were merged` (green) and the changes heading always `Changed (n resource group(s))`. The `DRY RUN` label, amber colour and `Would change` heading are gone, since the mail step returns before this point on dry runs.
+  - The subject is now built as `<mailSubject> - LIVE - <n> RG(s) changed` directly. `LIVE` is kept so inbox rules already keyed on it keep matching.
+  - `README.md` — emailed-report section updated to match.
 
 - 2026-09-25 — Don't send the email report on WhatIf (dry-run) runs.
   - `scripts/Invoke-TagReconciliation.ps1` — right after the summary line, `if ($WhatIfMode)` logs `Email report skipped - WhatIfMode is on (dry run).` and returns before any mail logic runs. The check comes before recipient resolution and the `MailFrom` check, so dry runs don't need the mail variables to be valid.
