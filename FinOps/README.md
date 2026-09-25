@@ -55,7 +55,7 @@ The pipeline YAML references each as `$(name)` and expects them to resolve at qu
 
 `mailTo` is the only optional one: leave it empty and the run reconciles as normal, logs `Email report skipped - no MailTo recipients configured`, and sends nothing. If `mailTo` is set but `mailFrom` is empty the script throws, because Graph app-only `sendMail` has no implicit sender.
 
-The final subject is `<mailSubject> - <DRY RUN|LIVE> - <n> RG(s) changed`, so a daily inbox rule can sort dry-run drift reports from real write runs.
+The final subject is `<mailSubject> - LIVE - <n> RG(s) changed`. Mail is only sent on live runs (`whatIf = false`); dry runs log `Email report skipped - WhatIfMode is on (dry run).` and send nothing, and don't check `mailFrom`/`mailTo` either.
 
 ### 2. UAMI and federated service connection
 
@@ -289,7 +289,7 @@ Run both checks. `Granted` alone only shows the mailbox is reachable; the `Denie
 
 ##### Step 3 - Verify end to end
 
-Run the pipeline in dry-run mode. The tail of the log prints `POST https://graph.microsoft.com/v1.0/users/...:/sendMail` followed by `Report sent.`, and the report lands in every `mailTo` inbox. A `403 ErrorAccessDenied` at that step means the app access policy is denying the sender - re-check that `-AppId` is the clientId and that `-PolicyScopeGroupId` names the same mailbox as `mailFrom`.
+Mail is only sent on live runs, so queue the pipeline with `whatIf = false` (scope the CSV down first if you don't want real tag writes during the test). The tail of the log prints `POST https://graph.microsoft.com/v1.0/users/...:/sendMail` followed by `Report sent.`, and the report lands in every `mailTo` inbox. A `403 ErrorAccessDenied` at that step means the app access policy is denying the sender - re-check that `-AppId` is the clientId and that `-PolicyScopeGroupId` names the same mailbox as `mailFrom`.
 
 #### 3d. Azure DevOps
 
@@ -311,15 +311,15 @@ Rows with an empty `SubscriptionName` or `ResourceGroupName` are skipped. Missin
 
 ### Scheduled (default)
 
-The `schedules:` block queues the pipeline daily at 06:00 UTC against `main`. It runs with `whatIf = true`, so nothing is written - the run logs what would change. Use these runs as a drift report.
+The `schedules:` block queues the pipeline daily at 06:00 UTC against `main`. It runs with `whatIf = true`, so nothing is written and no email is sent - the run logs what would change. Read the run log as the drift report.
 
 ### Ad-hoc dry run
 
-Queue the pipeline manually from ADO. Leave the `whatIf` parameter checked. Same behavior as the scheduled run.
+Queue the pipeline manually from ADO. Leave the `whatIf` parameter checked. Same behavior as the scheduled run: log only, no writes, no email.
 
 ### Real write
 
-Queue the pipeline manually and **uncheck `whatIf`** (or set it to `false`). The task then calls `Update-AzTag ... -Operation Merge` and verifies each written value.
+Queue the pipeline manually and **uncheck `whatIf`** (or set it to `false`). The task then calls `Update-AzTag ... -Operation Merge`, verifies each written value, and emails the HTML report.
 
 ## Operating notes
 
@@ -330,11 +330,11 @@ Queue the pipeline manually and **uncheck `whatIf`** (or set it to `false`). The
 - **Write mode**: `merged N key(s) OK` after each successful write. If verify fails, the run throws immediately.
 - **Dry-run mode**: `WhatIf: would merge N key(s)` instead of a write.
 - **Summary line** at the end: `Summary: inspected=X, matched=Y, updated=Z, unchanged=W`. `updated + unchanged = matched`. `matched ≤ inspected`.
-- **Report**: the last lines show the recipient list and the `sendMail` POST. Mail goes out only after the reconciliation loop finished without throwing, so receiving the report is itself the signal that the run succeeded - a run that dies mid-way sends nothing and fails the ADO task instead.
+- **Report** (live runs only): the last lines show the recipient list and the `sendMail` POST. Dry runs end with `Email report skipped - WhatIfMode is on (dry run).` Mail goes out only after the reconciliation loop finished without throwing, so receiving the report is itself the signal that the run succeeded - a run that dies mid-way sends nothing and fails the ADO task instead.
 
 ### The emailed report
 
-Sent on every successful run, dry-run included - the dry-run report is the daily drift report. It contains:
+Sent on every successful **live** run (`whatIf = false`). Dry runs, including the daily schedule, send nothing. It contains:
 
 - **Header** - `DRY RUN - no tags were written` (amber) or `LIVE - tags were merged` (green).
 - **Run metadata** - UTC timestamp, management group, CSV source URL.

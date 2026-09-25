@@ -17,8 +17,8 @@ Summary:
   - Values are trimmed of all whitespace and uppercased before compare/write.
   - Only keys whose current tag value differs from the CSV value are written.
   - Writes MERGE - tags outside the four managed keys are never touched.
-  - After a successful run, render an HTML report and mail it via Microsoft Graph
-    (POST /users/{MailFrom}/sendMail) using the same UAMI token.
+  - After a successful live run, render an HTML report and mail it via Microsoft Graph
+    (POST /users/{MailFrom}/sendMail) using the same UAMI token. WhatIf runs send no mail.
 
 .PARAMETER SharePointHostname
 Tenant hostname, e.g. "contoso.sharepoint.com".
@@ -438,7 +438,14 @@ Write-Host ("Summary: subs inspected={0}, matched={1}, skipped={2} | rgs inspect
 
 # --- HTML report --------------------------------------------------------------
 # Only reached when the reconciliation above completed without throwing, so the
-# report always describes a successful run.
+# report always describes a successful run. Dry runs (WhatIfMode) send nothing;
+# only live runs mail the report.
+
+if ($WhatIfMode) {
+    Write-Host ""
+    Write-Host "Email report skipped - WhatIfMode is on (dry run)."
+    return
+}
 
 # @() at the call site, not a wrapped return: the function's output unrolls, so an
 # empty recipient list has to be re-collected here or $recipients would be $null.

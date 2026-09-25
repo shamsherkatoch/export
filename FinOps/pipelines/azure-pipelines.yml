@@ -14,7 +14,7 @@ schedules:
 
 parameters:
   - name: whatIf
-    displayName: Dry run (report only, no writes)
+    displayName: Dry run (log only, no writes, no email)
     type: boolean
     default: true
 

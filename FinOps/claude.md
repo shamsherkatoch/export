@@ -57,7 +57,7 @@ Compare-and-update runs both sides through `ConvertTo-NormalizedTagValue` before
 - **Write**: `Update-AzTag -ResourceId $rg.ResourceId -Tag $toUpdate -Operation Merge`. Merge is required — never `-Operation Replace`.
 - **Verify**: after write, re-fetch the RG with `Get-AzResourceGroup` and assert each written key equals the expected normalized value. Mismatch throws.
 - **Summary**: script prints subscription counts (`subs inspected / matched / skipped`) and RG counts (`rgs inspected / matched / updated / unchanged`) at the end. `matched` = RGs whose `(sub, rg)` pair had a CSV row; `updated + unchanged = matched`.
-- **Report**: after the summary — i.e. only when the reconciliation loop completed without throwing — `New-ReconciliationHtmlReport` renders run metadata, the summary counters, and one table row per changed tag key (subscription, RG, key, current value, CSV value); `Send-GraphMailReport` POSTs it to `/v1.0/users/{MailFrom}/sendMail`. Sent in WhatIf mode too — the dry-run report is the daily drift report. Empty `-MailTo` skips the send; `-MailTo` set with an empty `-MailFrom` throws. All values pass through `ConvertTo-HtmlText` (`WebUtility::HtmlEncode`) before being written into the markup.
+- **Report**: after the summary — i.e. only when the reconciliation loop completed without throwing — `New-ReconciliationHtmlReport` renders run metadata, the summary counters, and one table row per changed tag key (subscription, RG, key, current value, CSV value); `Send-GraphMailReport` POSTs it to `/v1.0/users/{MailFrom}/sendMail`. Skipped entirely when `-WhatIfMode` is `$true` (checked before recipients or `-MailFrom` are validated), so scheduled dry runs send no mail. On live runs, empty `-MailTo` skips the send; `-MailTo` set with an empty `-MailFrom` throws. All values pass through `ConvertTo-HtmlText` (`WebUtility::HtmlEncode`) before being written into the markup.
 
 ## Pipeline parameters and variables
 
@@ -102,6 +102,13 @@ Pipeline variables defined directly on the pipeline (**Pipeline → Edit → Var
 ## Change log
 
 Newest first. One entry per change. Format: `YYYY-MM-DD — <short summary>`, followed by a short bullet list of what changed and why.
+
+- 2026-09-25 — Don't send the email report on WhatIf (dry-run) runs.
+  - `scripts/Invoke-TagReconciliation.ps1` — right after the summary line, `if ($WhatIfMode)` logs `Email report skipped - WhatIfMode is on (dry run).` and returns before any mail logic runs. The check comes before recipient resolution and the `MailFrom` check, so dry runs don't need the mail variables to be valid.
+  - Reverses the 2026-09-24 decision to mail dry runs as the daily drift report. The scheduled run is still dry-run by default, so it now sends no email; the drift is still in the run log. Only a manual run with `whatIf = false` sends a report.
+  - The DRY RUN branches in `New-ReconciliationHtmlReport` and the subject's mode tag are left in place; they are just never reached with `WhatIfMode = $true` now.
+  - `pipelines/azure-pipelines.yml` — `whatIf` display name now reads `Dry run (log only, no writes, no email)`.
+  - `README.md` — subject format, emailed-report section, scheduled/ad-hoc/real-write run descriptions, and the 3c step 3 mail verification (which now needs a `whatIf = false` run) updated to match.
 
 - 2026-09-25 — Fix `Argument types do not match` in `Sync-CsvWithAzure.ps1` when new RGs are appended.
   - Symptom: the sync task failed with only `##[error]Argument types do not match` whenever Azure had an RG not yet in the CSV and `whatIf` was `false`. Runs with nothing to append, or in WhatIf mode, returned before the failing line and passed.
