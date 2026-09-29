@@ -8,7 +8,7 @@ Reconcile Azure resource-group tags against a SharePoint-hosted CSV that is the 
 - Builds a nested index keyed by the pair **`(SubscriptionName, ResourceGroupName)`** - both case-insensitive and lower-cased. Every CSV row targets exactly one RG in exactly one subscription.
 - Enumerates every subscription under the configured management group (both id and display name captured from the descendants API).
 - For each subscription whose display name appears in the CSV, opens context on it and lists its RGs.
-- For each RG whose `(sub, rg)` pair is in the CSV, compares the four managed tag values (`BusinessUnit`, `CostObject`, `GeneralLedgerCode`, `FinancialDelegate`) after normalization (strip all whitespace, uppercase invariant) and merges only the keys whose current value differs from the CSV. Unmanaged tags on the RG are left untouched.
+- For each RG whose `(sub, rg)` pair is in the CSV, compares the four managed tag values (`BU`, `CO`, `GLC`, `FD`) after normalization (strip all whitespace, uppercase invariant) and merges only the keys whose current value differs from the CSV. Unmanaged tags on the RG are left untouched.
 - Re-reads the RG after writing and asserts the values took.
 - Prints a summary: `subs inspected/matched/skipped` and `rgs inspected/matched/updated/unchanged`.
 - On a successful run, renders an HTML report (run metadata, the summary counts, and a row per changed tag showing subscription, RG, key, current value, CSV value) and emails it through Microsoft Graph `sendMail` using the same UAMI token.

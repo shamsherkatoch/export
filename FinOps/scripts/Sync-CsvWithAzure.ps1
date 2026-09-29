@@ -19,9 +19,7 @@ the four managed keys (so humans see reality and can correct as needed).
     (if that column exists), ResourceGroupName, and - for each of the four managed
     tag keys - the RG's current tag value on that key (raw, as stored in Azure)
     or an empty cell if the RG has no such tag. Seeding from the RG rather than
-    leaving blank means the CSV reflects the real starting state; humans then
-    manually correct any values that are wrong, and reconciliation propagates
-    those corrections back to Azure.
+    leaving blank means the CSV reflects the real starting state
   - Existing rows are preserved verbatim - this script never rewrites a row that
     is already in the CSV, and never touches the four managed tag columns on
     existing rows even if the RG's Azure tags have drifted. Only the reconciliation
