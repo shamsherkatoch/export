@@ -1,5 +1,8 @@
 # Reconcile Azure RG tags from a SharePoint CSV.
-# Auth: UAMI + workload-identity federated service connection (no secrets).
+# Auth (no secrets): one UAMI and one workload-identity federated service connection
+# per tenant. The two script tasks run under the tenant A connection (SharePoint and
+# mail live in tenant A); to work in tenant B the scripts request an OIDC token for the
+# tenant B connection and sign in as tenant B's UAMI.
 
 trigger: none
 pr: none
@@ -23,8 +26,15 @@ variables:
   sharePointHostname: "mycloudgurucom.sharepoint.com"
   sharePointSitePath: "/sites/mycloudguru"
   csvItemPath: "poc/tags.csv"
-  managementGroupId: "MCGAU"
-  # Report email. mailTo accepts several addresses separated by ';' or ','.
+  # One "<tenantId>=<managementGroupName>" entry per tenant, separated by ','.
+  # Not ';' - the AzurePowerShell task rejects ';' in scriptArguments ("Detected
+  # characters in arguments that may not be executed correctly by the shell").
+  tenantScopes: "c6029515-0784-4bf6-a47e-6ce74d8063b0=MCGAU,aa4a4b3b-6b92-4866-acdb-e65a044e4efa=CBRTC"
+  # How to sign in to each tenant other than tenant A:
+  # "<tenantId>=<client id of that tenant's UAMI>:<id of its service connection>".
+  # The connection id is the resourceId GUID in the service connection's URL.
+  tenantConnections: "aa4a4b3b-6b92-4866-acdb-e65a044e4efa=<tenantB-uami-client-id>:<tenantB-service-connection-id>"
+  # Report email. mailTo accepts several addresses separated by ',' (not ';' - same task restriction).
   mailFrom: "admin@mycloudguru.com"
   mailTo: "shamsher.katoch@gmail.com"
   mailSubject: "Azure RG tag reconciliation"
@@ -49,11 +59,15 @@ jobs:
             -SharePointHostname "$(sharePointHostname)"
             -SharePointSitePath "$(sharePointSitePath)"
             -CsvItemPath "$(csvItemPath)"
-            -ManagementGroupId "$(managementGroupId)"
+            -TenantScopes "$(tenantScopes)"
+            -TenantConnections "$(tenantConnections)"
             -WhatIfMode:$${{ parameters.whatIf }}
           azurePowerShellVersion: LatestVersion
           pwsh: true
           failOnStandardError: true
+        # Needed to request the tenant B connection's OIDC token when switching tenant.
+        env:
+          SYSTEM_ACCESSTOKEN: $(System.AccessToken)
 
       - task: AzurePowerShell@5
         displayName: Invoke-TagReconciliation.ps1 (reconcile + email report)
@@ -65,7 +79,8 @@ jobs:
             -SharePointHostname "$(sharePointHostname)"
             -SharePointSitePath "$(sharePointSitePath)"
             -CsvItemPath "$(csvItemPath)"
-            -ManagementGroupId "$(managementGroupId)"
+            -TenantScopes "$(tenantScopes)"
+            -TenantConnections "$(tenantConnections)"
             -WhatIfMode:$${{ parameters.whatIf }}
             -MailFrom "$(mailFrom)"
             -MailTo "$(mailTo)"
@@ -73,3 +88,6 @@ jobs:
           azurePowerShellVersion: LatestVersion
           pwsh: true
           failOnStandardError: true
+        # Needed to request the tenant B connection's OIDC token when switching tenant.
+        env:
+          SYSTEM_ACCESSTOKEN: $(System.AccessToken)

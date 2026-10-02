@@ -1,19 +1,20 @@
 # FinOps - Azure RG Tag Reconciliation
 
-Reconcile Azure resource-group tags against a SharePoint-hosted CSV that is the source of truth for four FinOps tag values. An Azure DevOps pipeline runs a PowerShell task on a Microsoft-hosted agent, authenticates as a User-Assigned Managed Identity (UAMI) via a federated service connection, reads the CSV through Microsoft Graph, merges tag values onto every matching resource group under a target management group, and emails an HTML report of the run through Microsoft Graph.
+Reconcile Azure resource-group tags against a SharePoint-hosted CSV that is the source of truth for four FinOps tag values. An Azure DevOps pipeline runs two PowerShell tasks on a Microsoft-hosted agent, using one User-Assigned Managed Identity (UAMI) and one federated service connection **per tenant**. The CSV lives in Tenant A's SharePoint and has a `TenantId` column; the scripts read it as the Tenant A UAMI, then become each tenant's own UAMI in turn (Tenant A, Tenant B) to append newly created resource groups to the CSV, merge tag values onto every matching resource group under each tenant's management group, and email an HTML report of the run through Microsoft Graph.
 
 ## What it does
 
 - Pulls a CSV from SharePoint via Microsoft Graph.
-- Builds a nested index keyed by the pair **`(SubscriptionName, ResourceGroupName)`** - both case-insensitive and lower-cased. Every CSV row targets exactly one RG in exactly one subscription.
-- Enumerates every subscription under the configured management group (both id and display name captured from the descendants API).
+- Task 1 (`Sync-CsvWithAzure.ps1`) appends a row for every resource group that exists in a configured tenant but not in the CSV, filling `TenantId` and seeding the four tag columns from the RG's current tags. Existing rows are never modified.
+- Task 2 (`Invoke-TagReconciliation.ps1`) builds a nested index keyed by the triple **`(TenantId, SubscriptionName, ResourceGroupName)`** - all case-insensitive and lower-cased. Every CSV row targets exactly one RG in exactly one subscription in exactly one tenant.
+- For each tenant in `tenantScopes`, becomes that tenant's UAMI and enumerates every subscription under that tenant's management group (both id and display name captured from the descendants API).
 - For each subscription whose display name appears in the CSV, opens context on it and lists its RGs.
-- For each RG whose `(sub, rg)` pair is in the CSV, compares the four managed tag values (`BU`, `CO`, `GLC`, `FD`) after normalization (strip all whitespace, uppercase invariant) and merges only the keys whose current value differs from the CSV. Unmanaged tags on the RG are left untouched.
+- For each RG whose `(tenant, sub, rg)` triple is in the CSV, compares the four managed tag values (`BU`, `CO`, `GLC`, `FD`) after normalization (strip all whitespace, uppercase invariant) and merges only the keys whose current value differs from the CSV. Unmanaged tags on the RG are left untouched.
 - Re-reads the RG after writing and asserts the values took.
-- Prints a summary: `subs inspected/matched/skipped` and `rgs inspected/matched/updated/unchanged`.
-- On a successful run, renders an HTML report (run metadata, the summary counts, and a row per changed tag showing subscription, RG, key, current value, CSV value) and emails it through Microsoft Graph `sendMail` using the same UAMI token.
+- Prints a summary: `tenants inspected/skipped/failed`, `subs inspected/matched/skipped` and `rgs inspected/matched/updated/unchanged`.
+- On a successful run, renders an HTML report (run metadata, the summary counts, and a row per changed resource group with a column per tag showing current value → CSV value) and emails it through Microsoft Graph `sendMail` from a Tenant A mailbox.
 
-Subscriptions whose display name is not in the CSV are skipped entirely - the script does not enter them or list their RGs. Inside a matched subscription, RGs whose name isn't in that subscription's CSV rows are left alone.
+Tenants with no CSV rows are not signed in to by task 2. Subscriptions whose display name is not in the CSV for their tenant are skipped entirely - the script does not enter them or list their RGs. Inside a matched subscription, RGs whose name isn't in that subscription's CSV rows are left alone.
 
 ## Repository layout
 
@@ -21,9 +22,10 @@ Subscriptions whose display name is not in the CSV are skipped entirely - the sc
 FinOps/
 ├── README.md                              # This file - overview and operating notes
 ├── pipelines/
-│   └── azure-pipelines.yml                # ADO pipeline (schedule + task)
+│   └── azure-pipelines.yml                # ADO pipeline (schedule + two tasks)
 └── scripts/
-    └── Invoke-TagReconciliation.ps1       # PowerShell 7 reconciliation script
+    ├── Sync-CsvWithAzure.ps1              # Task 1 - append missing RGs to the CSV
+    └── Invoke-TagReconciliation.ps1       # Task 2 - reconcile tags + email report
 ```
 
 ## Runtime
@@ -31,7 +33,7 @@ FinOps/
 - **Where**: Azure DevOps, Microsoft-hosted `windows-latest` agent.
 - **When**: scheduled daily at 06:00 UTC (`schedules` block in the pipeline).
 - **Task**: `AzurePowerShell@5` with `pwsh: true`, `azurePowerShellVersion: LatestVersion`.
-- **Auth**: workload-identity federated service connection backed by the UAMI. No secrets in variables or scripts.
+- **Auth**: one workload-identity federated service connection per tenant, each backed by a UAMI in that tenant. The script tasks run under the Tenant A connection. To work in Tenant B the scripts request an OIDC token for the Tenant B connection from Azure DevOps and `Connect-AzAccount -FederatedToken` as the Tenant B UAMI, then switch back to the Tenant A login for SharePoint and mail. Both tasks map `SYSTEM_ACCESSTOKEN: $(System.AccessToken)` in `env:` for that request. No secrets in variables or scripts.
 - **Default mode**: dry run (`whatIf: true`). Scheduled runs report intended changes without writing.
 
 ## Prerequisites
@@ -42,13 +44,14 @@ Define these directly on the pipeline (**Pipelines → select the pipeline → E
 
 | Variable | Example | Purpose |
 | --- | --- | --- |
-| `serviceConnectionName` | `finops-uami-federated` | ADO service connection (federated) backed by the UAMI. |
+| `serviceConnectionName` | `sc-finops-tags` | ADO service connection (workload identity federation) backed by the UAMI in Tenant A. |
+| `tenantConnections` | `<tenantB-guid>=<uami-client-id>:<connection-id>` | For each tenant other than Tenant A: the client id of that tenant's UAMI and the id of its service connection (the `resourceId` GUID in the connection's URL). Entries separated by `,`. |
 | `sharePointHostname` | `contoso.sharepoint.com` | Host of the SharePoint tenant. |
 | `sharePointSitePath` | `/sites/finops` | Server-relative site path. |
 | `csvItemPath` | `Shared Documents/finops/tags.csv` | Drive-root-relative path to the CSV. |
-| `managementGroupId` | `mg-contoso-root` | Management group **name** (not display name). |
+| `tenantScopes` | `<tenantA-guid>=mg-a,<tenantB-guid>=mg-b` | One `<tenantId>=<managementGroupName>` entry per tenant, separated by `,` (not `;` - see failure modes). Tenant must be the GUID; management group is its **name** (not display name). One management group per tenant. |
 | `mailFrom` | `finops-reports@contoso.com` | Mailbox the HTML report is sent **from**. UPN or object id of a real Exchange Online mailbox. |
-| `mailTo` | `finops@contoso.com; cloudops@contoso.com` | Report recipients. **Multiple addresses are supported** - separate them with `;` or `,`. |
+| `mailTo` | `finops@contoso.com,cloudops@contoso.com` | Report recipients. **Multiple addresses are supported** - separate them with `,`. The script also accepts `;`, but the pipeline task rejects it. |
 | `mailSubject` | `Azure RG tag reconciliation` | Subject line base. The script appends the run mode and change count. |
 
 The pipeline YAML references each as `$(name)` and expects them to resolve at queue time - a missing variable fails the run at the `AzurePowerShell@5` step with an empty-argument error.
@@ -57,18 +60,33 @@ The pipeline YAML references each as `$(name)` and expects them to resolve at qu
 
 The final subject is `<mailSubject> - LIVE - <n> RG(s) changed`. Mail is only sent on live runs (`whatIf = false`); dry runs log `Email report skipped - WhatIfMode is on (dry run).` and send nothing, and don't check `mailFrom`/`mailTo` either.
 
-### 2. UAMI and federated service connection
+### 2. UAMIs and federated service connections
 
-- Create a User-Assigned Managed Identity in a suitable subscription.
-- In Azure DevOps, create a **workload identity federation (automatic or manual)** service connection that federates back to that UAMI. Name it to match `serviceConnectionName` above.
+Each tenant has its own identity and its own service connection. Nothing is shared across tenants and there is no app registration.
+
+| | Tenant A (home) | Tenant B |
+| --- | --- | --- |
+| Identity | UAMI in Tenant A | UAMI in Tenant B |
+| Service connection | `serviceConnectionName` | identified by id in `tenantConnections` |
+| Used for | Tenant A tags, SharePoint CSV, report mail | Tenant B tags only |
+
+For each tenant: create a User-Assigned Managed Identity in that tenant, then an Azure Resource Manager service connection using **workload identity federation** backed by it. For Tenant B, when the Azure DevOps organisation is connected to Tenant A, use the **manual** workload identity federation flow: enter Tenant B's tenant id and the UAMI's client id, then add the issuer and subject Azure DevOps shows as a federated credential on the Tenant B UAMI.
+
+The Tenant B connection does not appear by name in the pipeline YAML: the scripts request its OIDC token by id. Put Tenant B's tenant id, the UAMI's client id and the connection id in `tenantConnections`, and authorize the pipeline on the connection (Service connection → Security → Pipeline permissions) - Azure DevOps will not prompt for it.
 
 ### 3. UAMI access
 
-The service connection is backed by the UAMI, so every RBAC/Graph grant below is assigned to the UAMI's object (as principalId in `New-AzRoleAssignment`, or as the app in Graph). Assign at the **management group** scope so it inherits down to every subscription/RG the pipeline touches - do not assign per subscription.
+Assign Azure roles at the **management group** scope so they inherit down to every subscription/RG the pipeline touches - do not assign per subscription.
+
+| Grant | Tenant A UAMI | Tenant B UAMI |
+| --- | --- | --- |
+| Reader + Tag Contributor on that tenant's management group (3a) | yes | yes |
+| Graph `Sites.Selected` + site `write` (3b) | yes | no |
+| Graph `Mail.Send` + application access policy (3c) | yes | no |
 
 #### 3a. Azure Resource Manager (management group + everything under it)
 
-Assign these built-in roles to the UAMI at scope `/providers/Microsoft.Management/managementGroups/{managementGroupId}`:
+Do this **once in each tenant**. Assign these built-in roles to that tenant's UAMI at scope `/providers/Microsoft.Management/managementGroups/{managementGroupId}`:
 
 | Role | Why this script needs it | Key actions it grants |
 | --- | --- | --- |
@@ -86,24 +104,24 @@ Concrete actions the script exercises (all covered by the two roles above):
 
 Do **not** grant `Contributor` or `Owner` - Tag Contributor is the least-privileged write role that satisfies this workload. Do **not** grant `Microsoft.Authorization/*/write` - the pipeline never edits role assignments. If you build a custom role instead of using Tag Contributor, its `actions` must include everything in the bullet list above and the `notActions` must not exclude `Microsoft.Resources/tags/write`.
 
-Reference PowerShell to grant them (run once, per MG):
+Reference PowerShell to grant them (run once per tenant, signed in to that tenant with `Connect-AzAccount -Tenant <tenantId>`):
 
 ```powershell
 $mgScope   = "/providers/Microsoft.Management/managementGroups/<managementGroupId>"
-$uamiObjId = "<UAMI principalId (objectId of the managed identity)>"
+$uamiObjId = "<principalId (object id) of THIS TENANT's UAMI>"
 
 New-AzRoleAssignment -ObjectId $uamiObjId -RoleDefinitionName "Reader"          -Scope $mgScope
 New-AzRoleAssignment -ObjectId $uamiObjId -RoleDefinitionName "Tag Contributor" -Scope $mgScope
 ```
 
-#### 3b. Microsoft Graph → SharePoint (CSV read)
+#### 3b. Microsoft Graph → SharePoint (CSV read + write) - Tenant A UAMI only
 
 The UAMI needs Graph permission to download the CSV. The pipeline uses **`Sites.Selected`** (application permission), which grants access to **only** the specific SharePoint site you scope it to - not every site in the tenant. There are two grants to do, in order:
 
 1. **Tenant-level**: give the UAMI's service principal the `Sites.Selected` app permission on Microsoft Graph, and admin-consent it. This unlocks the *ability* to be granted per-site access, but on its own confers zero site access.
-2. **Site-level**: grant the UAMI `read` on the one SharePoint site that holds the CSV, via `POST /sites/{siteId}/permissions`. Only after this step will the pipeline be able to fetch the file.
+2. **Site-level**: grant the UAMI `read` and `write` on the one SharePoint site that holds the CSV, via `POST /sites/{siteId}/permissions`. Only after this step will the pipeline be able to fetch the file.
 
-`read` is sufficient - the script only downloads the file, it never writes back. Use `write` only if a future workload updates the CSV from Azure.
+`write` is required - `Sync-CsvWithAzure.ps1` PUTs the CSV back after appending missing RG rows.
 
 ##### Values you need before you start
 
@@ -177,7 +195,7 @@ $siteId
 
 The pipeline script does the same lookup at runtime, so the UAMI itself doesn't need this value stored anywhere - it's only used in step 3.
 
-##### Step 3 - Grant the UAMI `read` on that one site
+##### Step 3 - Grant the UAMI `read` + `write` on that one site
 
 `POST /sites/{siteId}/permissions` gives the UAMI's application the actual per-site access. Without this, `Sites.Selected` alone still returns `403` on every site.
 
@@ -210,7 +228,7 @@ Invoke-MgGraphRequest -Method DELETE `
 
 Impersonation isn't possible for a managed identity from your laptop, so the cleanest verification is to run the pipeline in dry-run mode (`whatIf = true`, the default). A successful run logs the CSV source URL and row count in its preamble - that proves the whole chain (tenant grant → site grant → file fetch) works. If Graph returns 401/403 there, jump to the [Common failure modes](#common-failure-modes) section for the fix path.
 
-#### 3c. Microsoft Graph → Exchange Online (send the HTML report)
+#### 3c. Microsoft Graph → Exchange Online (send the HTML report) - Tenant A UAMI only
 
 The UAMI sends the report itself - there is no SMTP account, no app password, no shared secret. It calls `POST /v1.0/users/{mailFrom}/sendMail` with the same token type used for SharePoint, so the only new thing to grant is the **`Mail.Send` application permission**, plus a scoping policy so the UAMI can send as *one* mailbox rather than the whole tenant.
 
@@ -293,19 +311,21 @@ Mail is only sent on live runs, so queue the pipeline with `whatIf = false` (sco
 
 #### 3d. Azure DevOps
 
-The workload-identity service connection (`serviceConnectionName`) must be **authorized for the pipeline** (either at project level or via a pipeline-scoped grant). No further ADO role beyond that is required on the UAMI.
+Both workload-identity service connections (`serviceConnectionName` and the Tenant B connection named by id in `tenantConnections`) must be **authorized for the pipeline** (either at project level or via a pipeline-scoped grant). No further ADO role beyond that is required on the app registration.
 
 ### 4. CSV shape
 
 CSV in SharePoint must have (at minimum) these headers:
 
 ```
-SubscriptionName,ResourceGroupName,BusinessUnit,CostObject,GeneralLedgerCode,FinancialDelegate
+TenantId,SubscriptionName,ResourceGroupName,BusinessUnit,CostObject,GeneralLedgerCode,FinancialDelegate
 ```
 
-Match is by the pair `(SubscriptionName, ResourceGroupName)`. `SubscriptionName` is the subscription's **display name** as shown in the Azure portal / `descendants` API. Each CSV row applies to exactly one RG in exactly one subscription - no wildcards, no cross-subscription broadcasts.
+Match is by the triple `(TenantId, SubscriptionName, ResourceGroupName)`. `TenantId` is the Entra tenant GUID the subscription lives in. `SubscriptionName` is the subscription's **display name** as shown in the Azure portal / `descendants` API. Each CSV row applies to exactly one RG in exactly one subscription - no wildcards, no cross-subscription broadcasts.
 
-Rows with an empty `SubscriptionName` or `ResourceGroupName` are skipped. Missing required columns cause `New-CsvIndex` to throw and fail the run. Duplicate `(SubscriptionName, ResourceGroupName)` pairs silently let the later row win - deduplicate at the source. Extra columns (e.g. `SubscriptionId` kept for humans, `Owner`, `Notes`) are ignored.
+A blank `TenantId` means Tenant A (the home tenant), so rows that predate the column keep working. Rows with an empty `SubscriptionName` or `ResourceGroupName` are skipped with a warning. Rows whose `TenantId` isn't listed in `tenantScopes` are ignored with a warning. Missing required columns cause `New-CsvIndex` to throw and fail the run. Duplicate `(TenantId, SubscriptionName, ResourceGroupName)` rows let the later row win, with a warning in the log - deduplicate at the source. Extra columns (e.g. `SubscriptionId` kept for humans, `Owner`, `Notes`) are ignored.
+
+**Migrating an existing CSV**: add the `TenantId` column header. Existing rows can be left blank - they are treated as Tenant A - or filled with Tenant A's GUID. Without the column both tasks fail with `CSV is missing required column: TenantId`. Tenant B rows always carry Tenant B's GUID; the sync task fills it in when it appends them.
 
 ## Running the pipeline
 
@@ -326,6 +346,7 @@ Queue the pipeline manually and **uncheck `whatIf`** (or set it to `false`). The
 ### Reading a run
 
 - **Preamble**: source URL of the CSV, row count, unique RG-tuple count, subscription count.
+- **Per tenant**: `##### Tenant: <tenantId> (management group '<mg>') #####`, with `Signing in to tenant ...` when the script switches tenant.
 - **Per subscription**: `=== Subscription: <guid> ===`, then per RG that matched a CSV row: one line per managed key, either `match ('X')` or `'old' -> 'new'`. RGs with no diffs log `no changes`.
 - **Write mode**: `merged N key(s) OK` after each successful write. If verify fails, the run throws immediately.
 - **Dry-run mode**: `WhatIf: would merge N key(s)` instead of a write.
@@ -337,9 +358,9 @@ Queue the pipeline manually and **uncheck `whatIf`** (or set it to `false`). The
 Sent on every successful **live** run (`whatIf = false`). Dry runs, including the daily schedule, send nothing. It contains:
 
 - **Header** - `LIVE - tags were merged` (green).
-- **Run metadata** - UTC timestamp, management group, CSV source URL.
-- **Summary** - the same seven counters printed in the log.
-- **Changes table** - one row per changed tag key: subscription, resource group, tag key, current Azure value, CSV value. The heading reads `Changed (n resource group(s))`. Tags with no current value show `(not set)`. If nothing differs, the table is replaced with a single "No tag differences found" line.
+- **Run metadata** - UTC timestamp, the tenant = management group list, CSV source URL.
+- **Summary** - the same ten counters printed in the log (tenants, subscriptions, resource groups).
+- **Changes table** - one row per changed resource group: tenant, subscription, resource group, then one column for each of the four tags showing `current → CSV value`. A tag that already matched shows a dash; a tag with no current value shows `(not set)`. The heading reads `Changed (n resource group(s))`. If nothing differs, the table is replaced with a single "No tag differences found" line.
 
 All values are HTML-encoded, so a stray `&` or `<` in a tag value cannot break the layout.
 
@@ -351,14 +372,20 @@ All values are HTML-encoded, so a stray `&` or `<` in a tag value cannot break t
 
 ### Common failure modes
 
-- **`Set-AzContext failed` on a subscription** - the UAMI likely lacks Reader on that subscription, or the subscription is disabled. Fix the role assignment; the script continues past the subscription and prints a warning.
+- **`Skipping tenant <id> - sign-in or subscription listing failed`** - the run carries on with the other tenants and counts this one in `tenantsFailed`. `403` on the `descendants` call: Reader is missing on that tenant's management group, or the management group name in `tenantScopes` is wrong.
+- **`Signing in to tenant <id> via service connection ...` fails** - the log prints the Entra error underneath. `AADSTS70021` / `AADSTS7002137` (no matching federated identity record): the federated credential on that tenant's UAMI doesn't match the service connection - the error text gives the subject it expects. An `Azure DevOps OIDC token error` line instead means Azure DevOps refused to issue a token for that connection to this task: check the pipeline is authorized to use the connection. `Cannot switch tenant: SYSTEM_OIDCREQUESTURI ...`: the task is missing `env: SYSTEM_ACCESSTOKEN: $(System.AccessToken)`.
+- **`TenantConnections entry ... is not in the form ...`** or **`... has no TenantConnections entry`** - the `tenantConnections` variable is missing Tenant B, or isn't `<tenantId>=<clientId>:<serviceConnectionId>`.
+- **`Detected characters in arguments that may not be executed correctly by the shell`** - the `AzurePowerShell@5` task validates `scriptArguments` before the script starts and rejects `;` (and other shell metacharacters such as `&`, `|`, `<`, `>`). A pipeline variable passed as an argument contains one - usually `tenantScopes` or `mailTo` using `;` as the separator. Use `,` instead.
+- **`TenantScopes entry ... is not a tenant GUID`** - the `tenantScopes` variable still holds a placeholder or a tenant domain name. Use the tenant GUID.
+- **`CSV has rows for TenantId '...', which is not in TenantScopes`** - a CSV row names a tenant the pipeline isn't configured for (often a typo in the GUID). Fix the row or add the tenant to `tenantScopes`.
+- **`Set-AzContext failed` on a subscription** - that tenant's UAMI likely lacks Reader on that subscription, or the subscription is disabled. Fix the role assignment; the script continues past the subscription and prints a warning.
 - **`CSV is missing required column`** - a header was renamed or removed. Fix the CSV; do not edit the script to accept the new name 
 - **`Verify failed for <RG>`** - the RG was written but the re-read did not observe the expected value. Usually caused by a concurrent tag write from another process. Re-run; if it persists, investigate the other writer.
-- **401/403 from Graph on the site fetch** - the UAMI is missing `Sites.Selected` consent or does not have `read` on the specific site. Re-grant via `POST /sites/{siteId}/pewritermissions`.
-- **Duplicate `(SubscriptionName, ResourceGroupName)` rows in CSV** - the last row wins (later rows overwrite earlier ones in `$index`). Deduplicate at the source.
+- **401/403 from Graph on the site fetch** - the Tenant A UAMI is missing `Sites.Selected` consent or does not have `read`/`write` on the specific site. Re-grant via `POST /sites/{siteId}/permissions`.
+- **Duplicate `(TenantId, SubscriptionName, ResourceGroupName)` rows in CSV** - the last row wins (later rows overwrite earlier ones in `$index`). Deduplicate at the source.
 - **Subscription display name changed and CSV wasn't updated** - the subscription silently drops out of scope (logged as `skipped - SubscriptionName '...' not in CSV`). Rename the CSV row to match, or rename the subscription back.
 - **RG renamed and CSV wasn't updated** - the CSV still targets the old name, so both the old CSV row and the new RG go untouched. Fix the CSV to reference the current RG name.
-- **`403 ErrorAccessDenied` on `sendMail`** - the Exchange application access policy is blocking the sender. Confirm `New-ApplicationAccessPolicy` was created with the UAMI's **clientId** (not its objectId) and that `-PolicyScopeGroupId` names the same mailbox as `mailFrom`: `Test-ApplicationAccessPolicy -Identity <mailFrom> -AppId <clientId>` must return `Granted`. Allow ~30 minutes after creating or editing a policy.
+- **`403 ErrorAccessDenied` on `sendMail`** - the Exchange application access policy is blocking the sender. Confirm `New-ApplicationAccessPolicy` was created with the Tenant A UAMI's **clientId** (not its objectId) and that `-PolicyScopeGroupId` names the same mailbox as `mailFrom`: `Test-ApplicationAccessPolicy -Identity <mailFrom> -AppId <clientId>` must return `Granted`. Allow ~30 minutes after creating or editing a policy.
 - **`404 (Not Found)` on `sendMail`** - about the **sender**, not the recipients and not the `Mail.Send` grant (a missing grant fails 403). `mailFrom` must resolve to a user object in this tenant - check the domain is one the tenant actually owns - and must have an Exchange Online mailbox; an unlicensed user, a distribution list and a mail-enabled security group all 404, a shared mailbox is fine. The log prints the Graph error alongside the failure; confirm with `Get-Mailbox <mailFrom>`.
 - **`401`/`403` immediately on `sendMail` but SharePoint worked** - `Mail.Send` was never granted, only `Sites.Selected`. Re-run step 1 of section 3c; the two grants are independent.
 - **Run succeeded but no email arrived** - check whether the log says `Email report skipped - no MailTo recipients configured`; that means the `mailTo` pipeline variable is empty or missing. Otherwise check the recipients' junk folders, since the sending mailbox is likely new.
