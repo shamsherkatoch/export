@@ -12,7 +12,7 @@ the four managed keys (so humans see reality and can correct as needed).
 .DESCRIPTION
   - Read the CSV from SharePoint via Microsoft Graph and capture the drive item's ETag.
   - For each tenant in -TenantScopes: sign the app registration (-AppClientId) in to
-    it with an assertion minted by the service connection's UAMI,
+    it with a fresh Azure DevOps OIDC token for the service connection,
     enumerate every subscription under its management group, then Set-AzContext +
     Get-AzResourceGroup in each to build the actual (tenant, sub, RG) set. Unlike
     the reconciliation task, this one has to look at every tenant and subscription -
@@ -50,7 +50,7 @@ The tenants to scan and the management group to scan in each, as
 
 .PARAMETER AppClientId
 Application (client) id of the multi-tenant app registration that does the work.
-The service connection's UAMI must be a federated credential on it.
+It must have a federated credential for the Azure DevOps service connection.
 
 .PARAMETER WhatIfMode
 When $true (default), log the rows that would be added but do not PUT the CSV back.
@@ -110,29 +110,81 @@ function Resolve-TenantScopes {
     return $out
 }
 
-function Get-BridgeAssertion {
-    # The service connection signs in as the UAMI; the app registration trusts that
-    # UAMI through a federated credential. A UAMI token for this fixed audience is
-    # the assertion that proves it, and it is accepted in every tenant the
-    # multi-tenant app has a service principal in. Only the UAMI can mint it, so the
-    # UAMI's context is made current first.
-    $null = Set-AzContext -Context $script:BridgeContext -WarningAction SilentlyContinue
-    return Get-AccessTokenPlain -ResourceUrl 'api://AzureADTokenExchange'
+function Get-PipelineOidcToken {
+    # Ask Azure DevOps for a fresh OIDC token for the service connection. The token
+    # names the service connection (issuer + subject), not the UAMI behind it, and the
+    # app registration has a federated credential trusting exactly that. A token for
+    # the UAMI itself cannot be used here: Entra rejects a token obtained through one
+    # federated credential as the assertion for another (AADSTS700231).
+    $requestUri   = $env:SYSTEM_OIDCREQUESTURI
+    $connectionId = $env:AZURESUBSCRIPTION_SERVICE_CONNECTION_ID
+    $systemToken  = $env:SYSTEM_ACCESSTOKEN
+    if (-not $requestUri -or -not $connectionId -or -not $systemToken) {
+        throw ("Cannot sign in as the app registration: SYSTEM_OIDCREQUESTURI, AZURESUBSCRIPTION_SERVICE_CONNECTION_ID " +
+               "and SYSTEM_ACCESSTOKEN must all be set. The first two come from the AzurePowerShell task; " +
+               "SYSTEM_ACCESSTOKEN must be mapped in the task's env: block.")
+    }
+    $uri  = "${requestUri}?api-version=7.1&serviceConnectionId=$connectionId"
+    $resp = Invoke-RestMethod -Method POST -Uri $uri `
+        -Headers @{ Authorization = "Bearer $systemToken" } `
+        -ContentType 'application/json'
+    return $resp.oidcToken
 }
 
 function Connect-Tenant {
     # Make the app registration, signed in to $TenantId, the default Az context.
-    # No-op when it already is. The UAMI never does any of the work itself - it is
-    # only the bridge that gets the app registration signed in, with no secret.
-    param([Parameter(Mandatory)][string] $TenantId)
+    # No-op when it already is, unless -Fresh: the Azure DevOps token is short-lived,
+    # so a sign-in made early in the run cannot be relied on to fetch a new token for
+    # another resource (Graph) at the end of it.
+    param([Parameter(Mandatory)][string] $TenantId, [switch] $Fresh)
     $ctx = Get-AzContext
-    if ($ctx -and $ctx.Tenant -and $ctx.Account -and
+    if (-not $Fresh -and $ctx -and $ctx.Tenant -and $ctx.Account -and
         "$($ctx.Tenant.Id)" -eq $TenantId -and "$($ctx.Account.Id)" -eq $AppClientId) { return }
 
-    Write-Host "Signing in to tenant $TenantId as app registration $AppClientId (federated via the UAMI)"
-    $assertion = Get-BridgeAssertion
-    $null = Connect-AzAccount -ServicePrincipal -ApplicationId $AppClientId -Tenant $TenantId `
-        -FederatedToken $assertion -Scope Process -WarningAction SilentlyContinue
+    Write-Host "Signing in to tenant $TenantId as app registration $AppClientId (federated via the service connection)"
+    $assertion = Get-PipelineOidcToken
+    try {
+        $null = Connect-AzAccount -ServicePrincipal -ApplicationId $AppClientId -Tenant $TenantId `
+            -FederatedToken $assertion -Scope Process -WarningAction SilentlyContinue
+    } catch {
+        # Connect-AzAccount reports any token failure as "Could not find tenant id for
+        # provided tenant domain", which hides the Entra error. Replay the same exchange
+        # against the token endpoint so the AADSTS code lands in the log, then rethrow.
+        Write-FederationDiagnostics -TenantId $TenantId -Assertion $assertion
+        throw
+    }
+}
+
+function Write-FederationDiagnostics {
+    param([string] $TenantId, [string] $Assertion)
+    try {
+        # iss / sub / aud are what the app registration's federated credential must
+        # match. They identify the service connection and are not secret; the token itself is not printed.
+        $payload = ($Assertion -split '\.')[1].Replace('-', '+').Replace('_', '/')
+        while ($payload.Length % 4) { $payload += '=' }
+        $claims = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($payload)) | ConvertFrom-Json
+        foreach ($name in @('iss', 'sub', 'aud', 'idtyp', 'ver')) {
+            if ($claims.PSObject.Properties.Name -contains $name) { Write-Host "  assertion ${name}: $($claims.$name)" }
+        }
+    } catch {
+        Write-Host "  could not decode the assertion: $($_.Exception.Message)"
+    }
+    try {
+        $null = Invoke-RestMethod -Method POST -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" -Body @{
+            grant_type            = 'client_credentials'
+            client_id             = $AppClientId
+            scope                 = 'https://management.azure.com/.default'
+            client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
+            client_assertion      = $Assertion
+        }
+        Write-Host "  token endpoint accepted the assertion - the failure is inside Connect-AzAccount, not Entra."
+    } catch {
+        if ($_.PSObject.Properties.Name -contains 'ErrorDetails' -and $_.ErrorDetails) {
+            Write-Host "  Entra token error: $($_.ErrorDetails.Message)"
+        } else {
+            Write-Host "  Entra token request failed: $($_.Exception.Message)"
+        }
+    }
 }
 
 function Get-SharePointCsv {
@@ -232,13 +284,12 @@ $scopes = @(Resolve-TenantScopes -Value $TenantScopes)
 if ($scopes.Count -eq 0) { throw "TenantScopes is empty. Expected '<tenantId>=<managementGroupId>[;...]'." }
 
 # The AzurePowerShell task signs in as the UAMI in the home tenant. The UAMI does none
-# of the work: its context is kept only to mint the assertion that signs the app
-# registration in. SharePoint lives in the home tenant, so the CSV GET and PUT
+# of the work; its login only tells us which tenant is home. SharePoint lives in the home tenant, so the CSV GET and PUT
 # both run as the app registration signed in there.
-$script:BridgeContext = Get-AzContext
-if (-not $script:BridgeContext -or -not $script:BridgeContext.Tenant) { throw "No Az context - the script must run signed in to the home tenant." }
-$homeTenantId = "$($script:BridgeContext.Tenant.Id)".ToLowerInvariant()
-Write-Host "Home tenant: $homeTenantId (signed in as $($script:BridgeContext.Account.Id))"
+$taskContext = Get-AzContext
+if (-not $taskContext -or -not $taskContext.Tenant) { throw "No Az context - the script must run signed in to the home tenant." }
+$homeTenantId = "$($taskContext.Tenant.Id)".ToLowerInvariant()
+Write-Host "Home tenant: $homeTenantId"
 Write-Host "Tenant scopes: $(($scopes | ForEach-Object { "$($_.TenantId) = $($_.ManagementGroupId)" }) -join '; ')"
 Connect-Tenant -TenantId $homeTenantId
 
@@ -384,6 +435,6 @@ foreach ($r in $newRows)  { $combined.Add($r) }
 $csvText  = ($combined | ConvertTo-Csv -NoTypeInformation) -join "`r`n"
 
 # SharePoint is in the home tenant; the loop above may have left another tenant active.
-Connect-Tenant -TenantId $homeTenantId
+Connect-Tenant -TenantId $homeTenantId -Fresh
 Set-SharePointCsv -SiteId $csv.SiteId -EncodedPath $csv.EncodedPath -ETag $csv.ETag -Content $csvText
 Write-Host "Uploaded updated CSV: +$($newRows.Count) row(s), total rows now $($combined.Count)."

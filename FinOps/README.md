@@ -1,6 +1,6 @@
 # FinOps - Azure RG Tag Reconciliation
 
-Reconcile Azure resource-group tags against a SharePoint-hosted CSV that is the source of truth for four FinOps tag values. An Azure DevOps pipeline runs two PowerShell tasks on a Microsoft-hosted agent, signing in through a federated service connection as a User-Assigned Managed Identity (UAMI), which is only a bridge to a **multi-tenant app registration** (homed in Tenant A) that does all the work. The CSV lives in Tenant A's SharePoint and has a `TenantId` column; the same app registration is signed in to each tenant in turn (Tenant A, Tenant B, ...) to append newly created resource groups to the CSV, merge tag values onto every matching resource group under each tenant's management group, and email an HTML report of the run through Microsoft Graph.
+Reconcile Azure resource-group tags against a SharePoint-hosted CSV that is the source of truth for four FinOps tag values. An Azure DevOps pipeline runs two PowerShell tasks on a Microsoft-hosted agent, signing in through a federated service connection as a User-Assigned Managed Identity (UAMI), while the work is done by a **multi-tenant app registration** (homed in Tenant A) that trusts the same service connection. The CSV lives in Tenant A's SharePoint and has a `TenantId` column; the same app registration is signed in to each tenant in turn (Tenant A, Tenant B, ...) to append newly created resource groups to the CSV, merge tag values onto every matching resource group under each tenant's management group, and email an HTML report of the run through Microsoft Graph.
 
 ## What it does
 
@@ -33,7 +33,7 @@ FinOps/
 - **Where**: Azure DevOps, Microsoft-hosted `windows-latest` agent.
 - **When**: scheduled daily at 06:00 UTC (`schedules` block in the pipeline).
 - **Task**: `AzurePowerShell@5` with `pwsh: true`, `azurePowerShellVersion: LatestVersion`.
-- **Auth**: workload-identity federated service connection backed by a UAMI in Tenant A. The UAMI is a federated credential on the multi-tenant app registration; the scripts get a UAMI token for `api://AzureADTokenExchange` and use it to `Connect-AzAccount -FederatedToken` as the app registration in each tenant. No secrets in variables or scripts.
+- **Auth**: workload-identity federated service connection backed by a UAMI in Tenant A. The multi-tenant app registration has its own federated credential for that service connection; the scripts request the connection's OIDC token from Azure DevOps and use it to `Connect-AzAccount -FederatedToken` as the app registration in each tenant. Both tasks map `SYSTEM_ACCESSTOKEN: $(System.AccessToken)` in `env:` for that request. No secrets in variables or scripts.
 - **Default mode**: dry run (`whatIf: true`). Scheduled runs report intended changes without writing.
 
 ## Prerequisites
@@ -49,9 +49,9 @@ Define these directly on the pipeline (**Pipelines → select the pipeline → E
 | `sharePointHostname` | `contoso.sharepoint.com` | Host of the SharePoint tenant. |
 | `sharePointSitePath` | `/sites/finops` | Server-relative site path. |
 | `csvItemPath` | `Shared Documents/finops/tags.csv` | Drive-root-relative path to the CSV. |
-| `tenantScopes` | `<tenantA-guid>=mg-a;<tenantB-guid>=mg-b` | One `<tenantId>=<managementGroupName>` entry per tenant, separated by `;`. Tenant must be the GUID; management group is its **name** (not display name). One management group per tenant. |
+| `tenantScopes` | `<tenantA-guid>=mg-a,<tenantB-guid>=mg-b` | One `<tenantId>=<managementGroupName>` entry per tenant, separated by `,` (not `;` - see failure modes). Tenant must be the GUID; management group is its **name** (not display name). One management group per tenant. |
 | `mailFrom` | `finops-reports@contoso.com` | Mailbox the HTML report is sent **from**. UPN or object id of a real Exchange Online mailbox. |
-| `mailTo` | `finops@contoso.com; cloudops@contoso.com` | Report recipients. **Multiple addresses are supported** - separate them with `;` or `,`. |
+| `mailTo` | `finops@contoso.com,cloudops@contoso.com` | Report recipients. **Multiple addresses are supported** - separate them with `,`. The script also accepts `;`, but the pipeline task rejects it. |
 | `mailSubject` | `Azure RG tag reconciliation` | Subject line base. The script appends the run mode and change count. |
 
 The pipeline YAML references each as `$(name)` and expects them to resolve at queue time - a missing variable fails the run at the `AzurePowerShell@5` step with an empty-argument error.
@@ -64,12 +64,12 @@ The final subject is `<mailSubject> - LIVE - <n> RG(s) changed`. Mail is only se
 
 Azure DevOps cannot create a service connection on a multi-tenant app registration, so there are two identities:
 
-- the **UAMI** (Tenant A) - what the service connection signs in as. It is only a bridge.
+- the **UAMI** (Tenant A) - what the service connection signs in as. It does none of the work.
 - the **multi-tenant app registration** (Tenant A) - does all the work, in every tenant.
 
 1. **UAMI + service connection**: create a User-Assigned Managed Identity in Tenant A and an Azure Resource Manager service connection using **workload identity federation** backed by it. Name it to match `serviceConnectionName`. The UAMI needs only what the connection needs to sign in - Reader on the subscription or management group the connection is scoped to. No Graph permissions, no Tag Contributor.
 2. **App registration** in Tenant A with supported account types **Accounts in any organizational directory (multitenant)**. No client secret, no certificate. Put its client id in the `appClientId` variable.
-3. **Federated credential on the app registration** (Certificates & secrets → Federated credentials → **Managed identity**) selecting the UAMI. That is: issuer `https://login.microsoftonline.com/<tenantA-id>/v2.0`, subject = the UAMI's **object (principal) id** (not its client id), audience `api://AzureADTokenExchange`. This one credential lets the pipeline sign in as the app in every tenant it has a service principal in.
+3. **Federated credential on the app registration** (Certificates & secrets → Federated credentials → **Other issuer**) for the *service connection itself*: open the UAMI → Federated credentials, and copy the issuer, subject identifier and audience of the credential Azure DevOps created there onto the app registration. Do **not** use the "Managed identity" scenario pointing at the UAMI - Entra rejects that chain with `AADSTS700231`. This one credential lets the pipeline sign in as the app in every tenant it has a service principal in.
 4. **Service principal in Tenant B**: admin consent in Tenant B creates it (visible under Enterprise applications). Consent also grants, in Tenant B, every Graph permission the app registration requested at that moment - if `Mail.Send` was listed, remove it from the Tenant B enterprise application's permissions; Tenant B needs only the RBAC in 3a.
 
 ### 3. App registration access
@@ -370,7 +370,8 @@ All values are HTML-encoded, so a stray `&` or `<` in a tag value cannot break t
 ### Common failure modes
 
 - **`Skipping tenant <id> - sign-in or subscription listing failed`** - the run carries on with the other tenants and counts this one in `tenantsFailed`. `AADSTS700016` / `AADSTS7000229` (application or service principal not found in the directory): the app has no service principal in that tenant - section 2 step 4. `403` on the `descendants` call: Reader is missing on that tenant's management group, or the management group name in `tenantScopes` is wrong.
-- **Run fails at `Signing in to tenant <home tenant> as app registration ...`** - the UAMI-to-app hop is broken. `AADSTS70021` / `AADSTS700213` (no matching federated identity record): the federated credential on the app registration doesn't name this UAMI - the subject must be the UAMI's object (principal) id and the issuer Tenant A's. `AADSTS700016`: `appClientId` is wrong. A failure on the line before it, getting the `api://AzureADTokenExchange` token, means the UAMI itself could not mint the assertion.
+- **Run fails at `Signing in to tenant <home tenant> as app registration ...`** - the log prints the token's `iss` / `sub` / `aud` and the Entra error underneath. `AADSTS70021` / `AADSTS700213` (no matching federated identity record): the federated credential on the app registration doesn't match those three values - copy them from the UAMI's federated credential (section 2 step 3). `AADSTS700231`: the credential is the "Managed identity" kind pointing at the UAMI, which cannot work from a pipeline. `AADSTS700016`: `appClientId` is wrong. `Cannot sign in as the app registration: SYSTEM_OIDCREQUESTURI ...`: the task is missing `env: SYSTEM_ACCESSTOKEN: $(System.AccessToken)`.
+- **`Detected characters in arguments that may not be executed correctly by the shell`** - the `AzurePowerShell@5` task validates `scriptArguments` before the script starts and rejects `;` (and other shell metacharacters such as `&`, `|`, `<`, `>`). A pipeline variable passed as an argument contains one - usually `tenantScopes` or `mailTo` using `;` as the separator. Use `,` instead.
 - **`TenantScopes entry ... is not a tenant GUID`** - the `tenantScopes` variable still holds a placeholder or a tenant domain name. Use the tenant GUID.
 - **`CSV has rows for TenantId '...', which is not in TenantScopes`** - a CSV row names a tenant the pipeline isn't configured for (often a typo in the GUID). Fix the row or add the tenant to `tenantScopes`.
 - **`Set-AzContext failed` on a subscription** - the app registration likely lacks Reader on that subscription, or the subscription is disabled. Fix the role assignment; the script continues past the subscription and prints a warning.

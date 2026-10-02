@@ -1,8 +1,9 @@
 # Reconcile Azure RG tags from a SharePoint CSV.
 # Auth (no secrets): the service connection signs in as a UAMI (workload identity
-# federation). The UAMI is a federated credential on a multi-tenant app registration
-# homed in tenant A; the scripts use it to sign that app registration in to each
-# tenant listed in tenantScopes. The app registration holds all the access.
+# federation). A multi-tenant app registration homed in tenant A has its own federated
+# credential trusting the same service connection; the scripts request a fresh OIDC
+# token for the connection and sign that app registration in to each tenant listed in
+# tenantScopes. The app registration holds all the access.
 
 trigger: none
 pr: none
@@ -28,11 +29,11 @@ variables:
   csvItemPath: "poc/tags.csv"
   # Application (client) id of the multi-tenant app registration. Replace the placeholder.
   appClientId: "a5bd7bed-6a10-4ced-930b-8afbacbcb95a"
-  # One "<tenantId>=<managementGroupName>" entry per tenant, separated by ';'.
-  # Replace both placeholders with the real tenant GUIDs (and tenant B's MG) -
-  # the scripts refuse to run until each tenant id is a GUID.
-  tenantScopes: "c6029515-0784-4bf6-a47e-6ce74d8063b0=MCGAU;aa4a4b3b-6b92-4866-acdb-e65a044e4efa=CBRTC"
-  # Report email. mailTo accepts several addresses separated by ';' or ','.
+  # One "<tenantId>=<managementGroupName>" entry per tenant, separated by ','.
+  # Not ';' - the AzurePowerShell task rejects ';' in scriptArguments ("Detected
+  # characters in arguments that may not be executed correctly by the shell").
+  tenantScopes: "c6029515-0784-4bf6-a47e-6ce74d8063b0=MCGAU,aa4a4b3b-6b92-4866-acdb-e65a044e4efa=CBRTC"
+  # Report email. mailTo accepts several addresses separated by ',' (not ';' - same task restriction).
   mailFrom: "admin@mycloudguru.com"
   mailTo: "shamsher.katoch@gmail.com"
   mailSubject: "Azure RG tag reconciliation"
@@ -63,6 +64,9 @@ jobs:
           azurePowerShellVersion: LatestVersion
           pwsh: true
           failOnStandardError: true
+        # Needed to request the service connection's OIDC token for the app registration sign-in.
+        env:
+          SYSTEM_ACCESSTOKEN: $(System.AccessToken)
 
       - task: AzurePowerShell@5
         displayName: Invoke-TagReconciliation.ps1 (reconcile + email report)
@@ -83,3 +87,6 @@ jobs:
           azurePowerShellVersion: LatestVersion
           pwsh: true
           failOnStandardError: true
+        # Needed to request the service connection's OIDC token for the app registration sign-in.
+        env:
+          SYSTEM_ACCESSTOKEN: $(System.AccessToken)
