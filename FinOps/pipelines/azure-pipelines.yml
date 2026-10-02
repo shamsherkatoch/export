@@ -27,11 +27,11 @@ variables:
   sharePointSitePath: "/sites/mycloudguru"
   csvItemPath: "poc/tags.csv"
   # Application (client) id of the multi-tenant app registration. Replace the placeholder.
-  appClientId: "<app-registration-client-id>"
+  appClientId: "a5bd7bed-6a10-4ced-930b-8afbacbcb95a"
   # One "<tenantId>=<managementGroupName>" entry per tenant, separated by ';'.
   # Replace both placeholders with the real tenant GUIDs (and tenant B's MG) -
   # the scripts refuse to run until each tenant id is a GUID.
-  tenantScopes: "<tenantA-id>=MCGAU;<tenantB-id>=<tenantB-managementGroup>"
+  tenantScopes: "c6029515-0784-4bf6-a47e-6ce74d8063b0=MCGAU;aa4a4b3b-6b92-4866-acdb-e65a044e4efa=CBRTC"
   # Report email. mailTo accepts several addresses separated by ';' or ','.
   mailFrom: "admin@mycloudguru.com"
   mailTo: "shamsher.katoch@gmail.com"
