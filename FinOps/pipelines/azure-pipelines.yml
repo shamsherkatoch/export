@@ -1,9 +1,8 @@
 # Reconcile Azure RG tags from a SharePoint CSV.
-# Auth (no secrets): the service connection signs in as a UAMI (workload identity
-# federation). A multi-tenant app registration homed in tenant A has its own federated
-# credential trusting the same service connection; the scripts request a fresh OIDC
-# token for the connection and sign that app registration in to each tenant listed in
-# tenantScopes. The app registration holds all the access.
+# Auth (no secrets): one UAMI and one workload-identity federated service connection
+# per tenant. The two script tasks run under the tenant A connection (SharePoint and
+# mail live in tenant A); to work in tenant B the scripts request an OIDC token for the
+# tenant B connection and sign in as tenant B's UAMI.
 
 trigger: none
 pr: none
@@ -27,8 +26,8 @@ variables:
   sharePointHostname: "mycloudgurucom.sharepoint.com"
   sharePointSitePath: "/sites/mycloudguru"
   csvItemPath: "poc/tags.csv"
-  # Application (client) id of the multi-tenant app registration. Replace the placeholder.
-  appClientId: "a5bd7bed-6a10-4ced-930b-8afbacbcb95a"
+  # Service connection backed by the UAMI in tenant B. Replace the placeholder.
+  tenantBServiceConnectionName: "sc-uami-poc-mcgau"
   # One "<tenantId>=<managementGroupName>" entry per tenant, separated by ','.
   # Not ';' - the AzurePowerShell task rejects ';' in scriptArguments ("Detected
   # characters in arguments that may not be executed correctly by the shell").
@@ -48,6 +47,26 @@ jobs:
     steps:
       - checkout: self
 
+      # Signs in to tenant B on its own connection. This proves the connection works,
+      # makes the pipeline reference it (so it is authorized to request its OIDC token
+      # later), and publishes the three values the scripts need to sign in to tenant B
+      # themselves - so none of them has to be configured by hand.
+      - task: AzurePowerShell@5
+        displayName: Tenant B connection check
+        inputs:
+          azureSubscription: $(tenantBServiceConnectionName)
+          scriptType: InlineScript
+          Inline: |
+            $ctx = Get-AzContext
+            if (-not $ctx -or -not $env:AZURESUBSCRIPTION_SERVICE_CONNECTION_ID) { throw "Tenant B sign-in did not produce a context and a service connection id." }
+            Write-Host ("Tenant B: " + $ctx.Tenant.Id)
+            Write-Host ("##vso[task.setvariable variable=tenantBTenantId]" + $ctx.Tenant.Id)
+            Write-Host ("##vso[task.setvariable variable=tenantBClientId]" + $ctx.Account.Id)
+            Write-Host ("##vso[task.setvariable variable=tenantBConnectionId]" + $env:AZURESUBSCRIPTION_SERVICE_CONNECTION_ID)
+          azurePowerShellVersion: LatestVersion
+          pwsh: true
+          failOnStandardError: true
+
       - task: AzurePowerShell@5
         displayName: Sync-CsvWithAzure.ps1 (append missing RGs)
         inputs:
@@ -59,12 +78,12 @@ jobs:
             -SharePointSitePath "$(sharePointSitePath)"
             -CsvItemPath "$(csvItemPath)"
             -TenantScopes "$(tenantScopes)"
-            -AppClientId "$(appClientId)"
+            -TenantConnections "$(tenantBTenantId)=$(tenantBClientId):$(tenantBConnectionId)"
             -WhatIfMode:$${{ parameters.whatIf }}
           azurePowerShellVersion: LatestVersion
           pwsh: true
           failOnStandardError: true
-        # Needed to request the service connection's OIDC token for the app registration sign-in.
+        # Needed to request the tenant B connection's OIDC token when switching tenant.
         env:
           SYSTEM_ACCESSTOKEN: $(System.AccessToken)
 
@@ -79,7 +98,7 @@ jobs:
             -SharePointSitePath "$(sharePointSitePath)"
             -CsvItemPath "$(csvItemPath)"
             -TenantScopes "$(tenantScopes)"
-            -AppClientId "$(appClientId)"
+            -TenantConnections "$(tenantBTenantId)=$(tenantBClientId):$(tenantBConnectionId)"
             -WhatIfMode:$${{ parameters.whatIf }}
             -MailFrom "$(mailFrom)"
             -MailTo "$(mailTo)"
@@ -87,6 +106,6 @@ jobs:
           azurePowerShellVersion: LatestVersion
           pwsh: true
           failOnStandardError: true
-        # Needed to request the service connection's OIDC token for the app registration sign-in.
+        # Needed to request the tenant B connection's OIDC token when switching tenant.
         env:
           SYSTEM_ACCESSTOKEN: $(System.AccessToken)

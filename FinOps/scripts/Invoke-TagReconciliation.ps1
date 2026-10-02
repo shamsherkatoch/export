@@ -7,13 +7,11 @@ Reconcile Azure resource-group tags against a CSV stored in SharePoint Online.
 
 .DESCRIPTION
 Summary:
-  - Read the CSV from SharePoint via Microsoft Graph, using the app registration's
-    OAuth token in its home tenant (the tenant the service connection signs in to).
-  - The service connection signs in as a UAMI, but the work is done by a multi-tenant
-    app registration (-AppClientId) that trusts the same service connection through
-    its own federated credential.
-  - For each tenant in -TenantScopes, sign that app registration in to the tenant
-    with a fresh Azure DevOps OIDC token, then enumerate every subscription
+  - Read the CSV from SharePoint via Microsoft Graph, using the home tenant UAMI's
+    OAuth token (the home tenant is the one the task's service connection signs in to).
+  - For each tenant in -TenantScopes, become that tenant's own UAMI - the task's
+    login for the home tenant, a fresh Azure DevOps OIDC token for that tenant's
+    service connection otherwise - then enumerate every subscription
     under that tenant's management group (returns both id and display name).
   - Match by the triple (TenantId, SubscriptionName, ResourceGroupName), all case-insensitive.
     Tenants with no CSV rows are not signed in to. Subscriptions with no CSV rows are
@@ -40,9 +38,11 @@ Drive-root-relative path to the CSV, e.g. "Shared Documents/finops/tags.csv".
 The tenants to reconcile and the management group to scan in each, as
 "<tenantId>=<managementGroupName>" entries separated by ';' or ','. One entry per tenant.
 
-.PARAMETER AppClientId
-Application (client) id of the multi-tenant app registration that does the work.
-It must have a federated credential for the Azure DevOps service connection.
+.PARAMETER TenantConnections
+For every tenant in -TenantScopes other than the home tenant (the one the task is
+signed in to): "<tenantId>=<clientId>:<serviceConnectionId>" - the client id of that
+tenant's UAMI and the id of the Azure DevOps service connection backed by it.
+Entries separated by ','. Not needed for a single-tenant run.
 
 .PARAMETER WhatIfMode
 When $true (default), log intended changes but do not write.
@@ -64,7 +64,7 @@ param(
     [Parameter(Mandatory)] [string] $SharePointSitePath,
     [Parameter(Mandatory)] [string] $CsvItemPath,
     [Parameter(Mandatory)] [string] $TenantScopes,
-    [Parameter(Mandatory)] [string] $AppClientId,
+    [Parameter()]          [string] $TenantConnections,
     [Parameter()]          [bool]   $WhatIfMode = $true,
     [Parameter()]          [string] $MailFrom,
     [Parameter()]          [string[]] $MailTo = @(),
@@ -130,55 +130,92 @@ function Resolve-TenantScopes {
     return $out
 }
 
-function Get-PipelineOidcToken {
-    # Ask Azure DevOps for a fresh OIDC token for the service connection. The token
-    # names the service connection (issuer + subject), not the UAMI behind it, and the
-    # app registration has a federated credential trusting exactly that. A token for
-    # the UAMI itself cannot be used here: Entra rejects a token obtained through one
-    # federated credential as the assertion for another (AADSTS700231).
-    $requestUri   = $env:SYSTEM_OIDCREQUESTURI
-    $connectionId = $env:AZURESUBSCRIPTION_SERVICE_CONNECTION_ID
-    $systemToken  = $env:SYSTEM_ACCESSTOKEN
-    if (-not $requestUri -or -not $connectionId -or -not $systemToken) {
-        throw ("Cannot sign in as the app registration: SYSTEM_OIDCREQUESTURI, AZURESUBSCRIPTION_SERVICE_CONNECTION_ID " +
-               "and SYSTEM_ACCESSTOKEN must all be set. The first two come from the AzurePowerShell task; " +
-               "SYSTEM_ACCESSTOKEN must be mapped in the task's env: block.")
+function Resolve-TenantConnections {
+    # "tenantB-guid=clientId:serviceConnectionId" -> @{ tenantId = {ClientId, ServiceConnectionId} }.
+    # One entry per tenant OTHER than the home tenant: the identity (a UAMI in that
+    # tenant) and the Azure DevOps service connection used to sign in to it. The home
+    # tenant needs no entry - the task is already signed in there.
+    param([AllowNull()][string] $Value)
+    $map = @{}
+    foreach ($part in ("$Value" -split '[;,]')) {
+        $entry = $part.Trim()
+        if (-not $entry) { continue }
+        $pieces = @($entry -split '=', 2)
+        $ids = if ($pieces.Count -eq 2) { @($pieces[1] -split ':', 2) } else { @() }
+        if ($ids.Count -ne 2 -or -not $pieces[0].Trim() -or -not $ids[0].Trim() -or -not $ids[1].Trim()) {
+            throw "TenantConnections entry '$entry' is not in the form <tenantId>=<clientId>:<serviceConnectionId>."
+        }
+        $map[$pieces[0].Trim().ToLowerInvariant()] = [pscustomobject]@{
+            ClientId            = $ids[0].Trim()
+            ServiceConnectionId = $ids[1].Trim()
+        }
     }
-    $uri  = "${requestUri}?api-version=7.1&serviceConnectionId=$connectionId"
-    $resp = Invoke-RestMethod -Method POST -Uri $uri `
-        -Headers @{ Authorization = "Bearer $systemToken" } `
-        -ContentType 'application/json'
+    return $map
+}
+
+function Get-PipelineOidcToken {
+    # Ask Azure DevOps for a fresh OIDC token for a service connection - the federated
+    # assertion that connection's UAMI trusts. Works for a connection other than the
+    # one the task runs under, as long as the pipeline is authorized to use it.
+    param([Parameter(Mandatory)][string] $ServiceConnectionId)
+    $requestUri  = $env:SYSTEM_OIDCREQUESTURI
+    $systemToken = $env:SYSTEM_ACCESSTOKEN
+    if (-not $requestUri -or -not $systemToken) {
+        throw ("Cannot switch tenant: SYSTEM_OIDCREQUESTURI and SYSTEM_ACCESSTOKEN must both be set. The first " +
+               "comes from the pipeline agent; SYSTEM_ACCESSTOKEN must be mapped in the task's env: block.")
+    }
+    $uri = "${requestUri}?api-version=7.1&serviceConnectionId=$ServiceConnectionId"
+    try {
+        $resp = Invoke-RestMethod -Method POST -Uri $uri `
+            -Headers @{ Authorization = "Bearer $systemToken" } `
+            -ContentType 'application/json'
+    } catch {
+        if ($_.PSObject.Properties.Name -contains 'ErrorDetails' -and $_.ErrorDetails) {
+            Write-Host "  Azure DevOps OIDC token error (service connection $ServiceConnectionId): $($_.ErrorDetails.Message)"
+        }
+        throw
+    }
     return $resp.oidcToken
 }
 
 function Connect-Tenant {
-    # Make the app registration, signed in to $TenantId, the default Az context.
-    # No-op when it already is, unless -Fresh: the Azure DevOps token is short-lived,
-    # so a sign-in made early in the run cannot be relied on to fetch a new token for
-    # another resource (Graph) at the end of it.
-    param([Parameter(Mandatory)][string] $TenantId, [switch] $Fresh)
+    # Make $TenantId the tenant of the default Az context. No-op when it already is.
+    # Home tenant: go back to the login the AzurePowerShell task made (its UAMI).
+    # Any other tenant: sign in as that tenant's own UAMI with a fresh OIDC token for
+    # that tenant's service connection. Each tenant has its own identity - no secret,
+    # and nothing shared across tenants.
+    param([Parameter(Mandatory)][string] $TenantId)
     $ctx = Get-AzContext
-    if (-not $Fresh -and $ctx -and $ctx.Tenant -and $ctx.Account -and
-        "$($ctx.Tenant.Id)" -eq $TenantId -and "$($ctx.Account.Id)" -eq $AppClientId) { return }
+    if ($ctx -and $ctx.Tenant -and "$($ctx.Tenant.Id)" -eq $TenantId) { return }
 
-    Write-Host "Signing in to tenant $TenantId as app registration $AppClientId (federated via the service connection)"
-    $assertion = Get-PipelineOidcToken
+    if ($TenantId -eq $script:HomeTenantId) {
+        Write-Host "Switching back to home tenant $TenantId"
+        $null = Set-AzContext -Context $script:HomeContext -WarningAction SilentlyContinue
+        return
+    }
+
+    if (-not $script:TenantConnectionMap.ContainsKey($TenantId)) {
+        throw "No TenantConnections entry for tenant $TenantId."
+    }
+    $conn = $script:TenantConnectionMap[$TenantId]
+    Write-Host "Signing in to tenant $TenantId via service connection $($conn.ServiceConnectionId)"
+    $assertion = Get-PipelineOidcToken -ServiceConnectionId $conn.ServiceConnectionId
     try {
-        $null = Connect-AzAccount -ServicePrincipal -ApplicationId $AppClientId -Tenant $TenantId `
+        $null = Connect-AzAccount -ServicePrincipal -ApplicationId $conn.ClientId -Tenant $TenantId `
             -FederatedToken $assertion -Scope Process -WarningAction SilentlyContinue
     } catch {
         # Connect-AzAccount reports any token failure as "Could not find tenant id for
         # provided tenant domain", which hides the Entra error. Replay the same exchange
         # against the token endpoint so the AADSTS code lands in the log, then rethrow.
-        Write-FederationDiagnostics -TenantId $TenantId -Assertion $assertion
+        Write-FederationDiagnostics -TenantId $TenantId -ClientId $conn.ClientId -Assertion $assertion
         throw
     }
 }
 
 function Write-FederationDiagnostics {
-    param([string] $TenantId, [string] $Assertion)
+    param([string] $TenantId, [string] $ClientId, [string] $Assertion)
     try {
-        # iss / sub / aud are what the app registration's federated credential must
+        # iss / sub / aud are what that tenant's UAMI federated credential must
         # match. They identify the service connection and are not secret; the token itself is not printed.
         $payload = ($Assertion -split '\.')[1].Replace('-', '+').Replace('_', '/')
         while ($payload.Length % 4) { $payload += '=' }
@@ -192,7 +229,7 @@ function Write-FederationDiagnostics {
     try {
         $null = Invoke-RestMethod -Method POST -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" -Body @{
             grant_type            = 'client_credentials'
-            client_id             = $AppClientId
+            client_id             = $ClientId
             scope                 = 'https://management.azure.com/.default'
             client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
             client_assertion      = $Assertion
@@ -488,15 +525,25 @@ $scopes = @(Resolve-TenantScopes -Value $TenantScopes)
 if ($scopes.Count -eq 0) { throw "TenantScopes is empty. Expected '<tenantId>=<managementGroupId>[;...]'." }
 $scopeLabel = ($scopes | ForEach-Object { "$($_.TenantId) = $($_.ManagementGroupId)" }) -join '; '
 
-# The AzurePowerShell task signs in as the UAMI in the home tenant. The UAMI does none
-# of the work; its login only tells us which tenant is home. SharePoint and the report mailbox live in the home tenant, so
-# every Graph call runs as the app registration signed in there.
-$taskContext = Get-AzContext
-if (-not $taskContext -or -not $taskContext.Tenant) { throw "No Az context - the script must run signed in to the home tenant." }
-$homeTenantId = "$($taskContext.Tenant.Id)".ToLowerInvariant()
+# The AzurePowerShell task signs in as the home tenant's UAMI, and that login is kept
+# so the script can return to it. SharePoint and the report mailbox live there, so every Graph call is
+# made as this identity. Other tenants are entered as their own UAMI.
+$script:HomeContext = Get-AzContext
+if (-not $script:HomeContext -or -not $script:HomeContext.Tenant) { throw "No Az context - the script must run signed in to the home tenant." }
+$script:HomeTenantId = "$($script:HomeContext.Tenant.Id)".ToLowerInvariant()
+$homeTenantId = $script:HomeTenantId
 Write-Host "Home tenant: $homeTenantId"
 Write-Host "Tenant scopes: $scopeLabel"
-Connect-Tenant -TenantId $homeTenantId
+
+# Fail before doing any work if a tenant has no way to be signed in to.
+# Not $script:TenantConnections: at script scope that IS the [string] parameter, and
+# assigning the hashtable to it would turn it back into a string.
+$script:TenantConnectionMap = Resolve-TenantConnections -Value $TenantConnections
+foreach ($scope in $scopes) {
+    if ($scope.TenantId -ne $homeTenantId -and -not $script:TenantConnectionMap.ContainsKey($scope.TenantId)) {
+        throw "Tenant $($scope.TenantId) is in TenantScopes but is not the home tenant and has no TenantConnections entry."
+    }
+}
 
 $csvSource = "https://$SharePointHostname$SharePointSitePath/$CsvItemPath"
 Write-Host "Reading CSV from SharePoint: $csvSource"
@@ -647,7 +694,7 @@ $subject = "{0} - LIVE - {1} RG(s) changed" -f $MailSubject, $stats.rgsUpdated
 
 Write-Host ""
 # The mailbox is in the home tenant; the loop above may have left another tenant active.
-Connect-Tenant -TenantId $homeTenantId -Fresh
+Connect-Tenant -TenantId $homeTenantId
 Write-Host "Sending report to $($recipients.Count) recipient(s): $($recipients -join ', ')"
 Send-GraphMailReport -From $MailFrom -To $recipients -Subject $subject -HtmlBody $html
 Write-Host "Report sent."

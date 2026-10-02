@@ -1,13 +1,13 @@
 # FinOps - Azure RG Tag Reconciliation
 
-Reconcile Azure resource-group tags against a SharePoint-hosted CSV that is the source of truth for four FinOps tag values. An Azure DevOps pipeline runs two PowerShell tasks on a Microsoft-hosted agent, signing in through a federated service connection as a User-Assigned Managed Identity (UAMI), while the work is done by a **multi-tenant app registration** (homed in Tenant A) that trusts the same service connection. The CSV lives in Tenant A's SharePoint and has a `TenantId` column; the same app registration is signed in to each tenant in turn (Tenant A, Tenant B, ...) to append newly created resource groups to the CSV, merge tag values onto every matching resource group under each tenant's management group, and email an HTML report of the run through Microsoft Graph.
+Reconcile Azure resource-group tags against a SharePoint-hosted CSV that is the source of truth for four FinOps tag values. An Azure DevOps pipeline runs two PowerShell tasks on a Microsoft-hosted agent, using one User-Assigned Managed Identity (UAMI) and one federated service connection **per tenant**. The CSV lives in Tenant A's SharePoint and has a `TenantId` column; the scripts read it as the Tenant A UAMI, then become each tenant's own UAMI in turn (Tenant A, Tenant B) to append newly created resource groups to the CSV, merge tag values onto every matching resource group under each tenant's management group, and email an HTML report of the run through Microsoft Graph.
 
 ## What it does
 
 - Pulls a CSV from SharePoint via Microsoft Graph.
 - Task 1 (`Sync-CsvWithAzure.ps1`) appends a row for every resource group that exists in a configured tenant but not in the CSV, filling `TenantId` and seeding the four tag columns from the RG's current tags. Existing rows are never modified.
 - Task 2 (`Invoke-TagReconciliation.ps1`) builds a nested index keyed by the triple **`(TenantId, SubscriptionName, ResourceGroupName)`** - all case-insensitive and lower-cased. Every CSV row targets exactly one RG in exactly one subscription in exactly one tenant.
-- For each tenant in `tenantScopes`, signs the app registration in to that tenant with a fresh federated token and enumerates every subscription under that tenant's management group (both id and display name captured from the descendants API).
+- For each tenant in `tenantScopes`, becomes that tenant's UAMI and enumerates every subscription under that tenant's management group (both id and display name captured from the descendants API).
 - For each subscription whose display name appears in the CSV, opens context on it and lists its RGs.
 - For each RG whose `(tenant, sub, rg)` triple is in the CSV, compares the four managed tag values (`BU`, `CO`, `GLC`, `FD`) after normalization (strip all whitespace, uppercase invariant) and merges only the keys whose current value differs from the CSV. Unmanaged tags on the RG are left untouched.
 - Re-reads the RG after writing and asserts the values took.
@@ -33,7 +33,7 @@ FinOps/
 - **Where**: Azure DevOps, Microsoft-hosted `windows-latest` agent.
 - **When**: scheduled daily at 06:00 UTC (`schedules` block in the pipeline).
 - **Task**: `AzurePowerShell@5` with `pwsh: true`, `azurePowerShellVersion: LatestVersion`.
-- **Auth**: workload-identity federated service connection backed by a UAMI in Tenant A. The multi-tenant app registration has its own federated credential for that service connection; the scripts request the connection's OIDC token from Azure DevOps and use it to `Connect-AzAccount -FederatedToken` as the app registration in each tenant. Both tasks map `SYSTEM_ACCESSTOKEN: $(System.AccessToken)` in `env:` for that request. No secrets in variables or scripts.
+- **Auth**: one workload-identity federated service connection per tenant, each backed by a UAMI in that tenant. The script tasks run under the Tenant A connection. To work in Tenant B the scripts request an OIDC token for the Tenant B connection from Azure DevOps and `Connect-AzAccount -FederatedToken` as the Tenant B UAMI, then switch back to the Tenant A login for SharePoint and mail. Both tasks map `SYSTEM_ACCESSTOKEN: $(System.AccessToken)` in `env:` for that request. No secrets in variables or scripts.
 - **Default mode**: dry run (`whatIf: true`). Scheduled runs report intended changes without writing.
 
 ## Prerequisites
@@ -45,7 +45,7 @@ Define these directly on the pipeline (**Pipelines → select the pipeline → E
 | Variable | Example | Purpose |
 | --- | --- | --- |
 | `serviceConnectionName` | `sc-finops-tags` | ADO service connection (workload identity federation) backed by the UAMI in Tenant A. |
-| `appClientId` | `183dd23f-...` | Application (client) id of the multi-tenant app registration. |
+| `tenantBServiceConnectionName` | `sc-finops-tags-tenantb` | ADO service connection (workload identity federation) backed by the UAMI in Tenant B. |
 | `sharePointHostname` | `contoso.sharepoint.com` | Host of the SharePoint tenant. |
 | `sharePointSitePath` | `/sites/finops` | Server-relative site path. |
 | `csvItemPath` | `Shared Documents/finops/tags.csv` | Drive-root-relative path to the CSV. |
@@ -60,31 +60,33 @@ The pipeline YAML references each as `$(name)` and expects them to resolve at qu
 
 The final subject is `<mailSubject> - LIVE - <n> RG(s) changed`. Mail is only sent on live runs (`whatIf = false`); dry runs log `Email report skipped - WhatIfMode is on (dry run).` and send nothing, and don't check `mailFrom`/`mailTo` either.
 
-### 2. UAMI, app registration and federated service connection
+### 2. UAMIs and federated service connections
 
-Azure DevOps cannot create a service connection on a multi-tenant app registration, so there are two identities:
+Each tenant has its own identity and its own service connection. Nothing is shared across tenants and there is no app registration.
 
-- the **UAMI** (Tenant A) - what the service connection signs in as. It does none of the work.
-- the **multi-tenant app registration** (Tenant A) - does all the work, in every tenant.
-
-1. **UAMI + service connection**: create a User-Assigned Managed Identity in Tenant A and an Azure Resource Manager service connection using **workload identity federation** backed by it. Name it to match `serviceConnectionName`. The UAMI needs only what the connection needs to sign in - Reader on the subscription or management group the connection is scoped to. No Graph permissions, no Tag Contributor.
-2. **App registration** in Tenant A with supported account types **Accounts in any organizational directory (multitenant)**. No client secret, no certificate. Put its client id in the `appClientId` variable.
-3. **Federated credential on the app registration** (Certificates & secrets → Federated credentials → **Other issuer**) for the *service connection itself*: open the UAMI → Federated credentials, and copy the issuer, subject identifier and audience of the credential Azure DevOps created there onto the app registration. Do **not** use the "Managed identity" scenario pointing at the UAMI - Entra rejects that chain with `AADSTS700231`. This one credential lets the pipeline sign in as the app in every tenant it has a service principal in.
-4. **Service principal in Tenant B**: admin consent in Tenant B creates it (visible under Enterprise applications). Consent also grants, in Tenant B, every Graph permission the app registration requested at that moment - if `Mail.Send` was listed, remove it from the Tenant B enterprise application's permissions; Tenant B needs only the RBAC in 3a.
-
-### 3. App registration access
-
-The app has **one service principal per tenant, each with a different object id**. Azure RBAC is assigned to the service principal of the tenant the management group is in (Entra ID → Enterprise applications → the app → Object ID, looked up *in that tenant*). Assign at the **management group** scope so it inherits down to every subscription/RG the pipeline touches - do not assign per subscription.
-
-| Grant | Tenant A | Tenant B |
+| | Tenant A (home) | Tenant B |
 | --- | --- | --- |
-| Reader + Tag Contributor on the management group (3a) | yes | yes |
+| Identity | UAMI in Tenant A | UAMI in Tenant B |
+| Service connection | `serviceConnectionName` | `tenantBServiceConnectionName` |
+| Used for | Tenant A tags, SharePoint CSV, report mail | Tenant B tags only |
+
+For each tenant: create a User-Assigned Managed Identity in that tenant, then an Azure Resource Manager service connection using **workload identity federation** backed by it. For Tenant B, when the Azure DevOps organisation is connected to Tenant A, use the **manual** workload identity federation flow: enter Tenant B's tenant id and the UAMI's client id, then add the issuer and subject Azure DevOps shows as a federated credential on the Tenant B UAMI.
+
+The pipeline's first step (`Tenant B connection check`) signs in on the Tenant B connection and publishes its tenant id, client id and connection id as variables, which the two script tasks receive as `-TenantConnections`. Nothing about Tenant B other than the connection name is configured by hand.
+
+### 3. UAMI access
+
+Assign Azure roles at the **management group** scope so they inherit down to every subscription/RG the pipeline touches - do not assign per subscription.
+
+| Grant | Tenant A UAMI | Tenant B UAMI |
+| --- | --- | --- |
+| Reader + Tag Contributor on that tenant's management group (3a) | yes | yes |
 | Graph `Sites.Selected` + site `write` (3b) | yes | no |
 | Graph `Mail.Send` + application access policy (3c) | yes | no |
 
 #### 3a. Azure Resource Manager (management group + everything under it)
 
-Do this **once in each tenant**. Assign these built-in roles to that tenant's service principal at scope `/providers/Microsoft.Management/managementGroups/{managementGroupId}`:
+Do this **once in each tenant**. Assign these built-in roles to that tenant's UAMI at scope `/providers/Microsoft.Management/managementGroups/{managementGroupId}`:
 
 | Role | Why this script needs it | Key actions it grants |
 | --- | --- | --- |
@@ -106,44 +108,45 @@ Reference PowerShell to grant them (run once per tenant, signed in to that tenan
 
 ```powershell
 $mgScope   = "/providers/Microsoft.Management/managementGroups/<managementGroupId>"
-$spObjId   = "<object id of the app's service principal IN THIS TENANT>"
+$uamiObjId = "<principalId (object id) of THIS TENANT's UAMI>"
 
-New-AzRoleAssignment -ObjectId $spObjId   -RoleDefinitionName "Reader"          -Scope $mgScope
-New-AzRoleAssignment -ObjectId $spObjId   -RoleDefinitionName "Tag Contributor" -Scope $mgScope
+New-AzRoleAssignment -ObjectId $uamiObjId -RoleDefinitionName "Reader"          -Scope $mgScope
+New-AzRoleAssignment -ObjectId $uamiObjId -RoleDefinitionName "Tag Contributor" -Scope $mgScope
 ```
 
-#### 3b. Microsoft Graph → SharePoint (CSV read + write) - Tenant A only
+#### 3b. Microsoft Graph → SharePoint (CSV read + write) - Tenant A UAMI only
 
-The app registration needs Graph permission to download the CSV. The pipeline uses **`Sites.Selected`** (application permission), which grants access to **only** the specific SharePoint site you scope it to - not every site in the tenant. There are two grants to do, in order:
+The UAMI needs Graph permission to download the CSV. The pipeline uses **`Sites.Selected`** (application permission), which grants access to **only** the specific SharePoint site you scope it to - not every site in the tenant. There are two grants to do, in order:
 
-1. **Tenant-level**: give the app's Tenant A service principal the `Sites.Selected` app permission on Microsoft Graph, and admin-consent it. This unlocks the *ability* to be granted per-site access, but on its own confers zero site access.
-2. **Site-level**: grant the app `read` and `write` on the one SharePoint site that holds the CSV, via `POST /sites/{siteId}/permissions`. Only after this step will the pipeline be able to fetch the file.
+1. **Tenant-level**: give the UAMI's service principal the `Sites.Selected` app permission on Microsoft Graph, and admin-consent it. This unlocks the *ability* to be granted per-site access, but on its own confers zero site access.
+2. **Site-level**: grant the UAMI `read` and `write` on the one SharePoint site that holds the CSV, via `POST /sites/{siteId}/permissions`. Only after this step will the pipeline be able to fetch the file.
 
 `write` is required - `Sync-CsvWithAzure.ps1` PUTs the CSV back after appending missing RG rows.
 
 ##### Values you need before you start
 
-Collect these once and reuse them. All lookups use the `Microsoft.Graph` PowerShell modules. Install once with:
+Collect these once and reuse them. All lookups use PowerShell: `Az.ManagedServiceIdentity` for the UAMI and `Microsoft.Graph.Applications` for Graph. Install once with:
 
 ```powershell
-Install-Module Microsoft.Graph.Applications, Microsoft.Graph.Sites -Scope CurrentUser
+Install-Module Az.ManagedServiceIdentity, Microsoft.Graph.Applications, Microsoft.Graph.Sites -Scope CurrentUser
 ```
 
 | Value | Where to find it |
 | --- | --- |
-| **App `clientId`** (aka `appId`) | Entra ID → App registrations → the app → Overview → **Application (client) ID**. Same in every tenant. |
-| **Service principal `objectId`** (Tenant A) | Entra ID → **Enterprise applications** → the app → **Object ID** - not the object id shown under App registrations. Also `(Get-MgServicePrincipal -Filter "appId eq '<clientId>'").Id`. |
-| **App display name** | The app registration's name - used only as a label in the Graph permissions payload. |
+| **UAMI `clientId`** (aka `appId`) | Azure Portal → the Managed Identity → Overview → **Client ID**. Also `(Get-AzUserAssignedIdentity -Name <uami> -ResourceGroupName <rg>).ClientId`. |
+| **UAMI `objectId`** (service principal id in Entra) | Azure Portal → the Managed Identity → Overview → **Object (principal) ID**. Also `(Get-AzUserAssignedIdentity -Name <uami> -ResourceGroupName <rg>).PrincipalId`. |
+| **UAMI display name** | The Managed Identity's name - used only as a label in the Graph permissions payload. |
 | **Microsoft Graph service principal `objectId`** in your tenant | `(Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'").Id` (the `00000003-…` app id is Microsoft Graph, the same in every tenant; the service principal's object id is per-tenant). |
 | **`Sites.Selected` app-role id** | `9492366f-7969-46a4-8d15-ed1a20078fff` - same in every tenant, no need to look it up. |
 | **`siteId`** for the SharePoint site | Resolve via Graph - see step 2 below. Format is `{host},{siteCollectionGuid},{siteGuid}`. |
 
-You'll need a signed-in admin (either an Entra admin who can grant app-role assignments and admin-consent Graph permissions, or a SharePoint admin / site owner who can grant site permissions - usually the same person can do both). The pipeline's app registration cannot grant these permissions to itself; a human runs this once.
+You'll need a signed-in admin (either an Entra admin who can grant app-role assignments and admin-consent Graph permissions, or a SharePoint admin / site owner who can grant site permissions - usually the same person can do both). The pipeline's UAMI cannot grant these permissions to itself; a human runs this once.
 
 Sign in once at the top of the session and reuse the connection for every step below:
 
 ```powershell
-Connect-MgGraph -TenantId "<tenantA-id>" -Scopes `
+Connect-AzAccount                              # for Az.ManagedServiceIdentity lookups
+Connect-MgGraph -Scopes `
   "AppRoleAssignment.ReadWrite.All", `
   "Application.Read.All", `
   "Sites.FullControl.All"                      # required to POST /sites/{id}/permissions
@@ -151,33 +154,33 @@ Connect-MgGraph -TenantId "<tenantA-id>" -Scopes `
 
 ##### Step 1 - Grant `Sites.Selected` at the tenant and admin-consent it
 
-Assigns the Graph `Sites.Selected` app role to the app's Tenant A service principal. Do this once per app.
+Assigns the Graph `Sites.Selected` app role to the UAMI's service principal. Do this once per UAMI.
 
 ```powershell
-$spObjectId        = "e1856993-XXXXX-ZZZZ"   # Tenant A service principal (Enterprise application) object id
+$uamiObjectId      = "e1856993-XXXXX-ZZZZ"   # principalId of the managed identity
 $graphSp           = Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'"
 $sitesSelectedRole = $graphSp.AppRoles | Where-Object { $_.Value -eq "Sites.Selected" }
 
 New-MgServicePrincipalAppRoleAssignment `
-  -ServicePrincipalId $spObjectId `
-  -PrincipalId        $spObjectId `
+  -ServicePrincipalId $uamiObjectId `
+  -PrincipalId        $uamiObjectId `
   -ResourceId         $graphSp.Id `
   -AppRoleId          $sitesSelectedRole.Id
 ```
 
-A successful call returns an `appRoleAssignment` object. Because you granted an *application* permission directly to a service principal, this **is** the admin consent - there is no separate "Grant admin consent" click needed.
+A successful call returns an `appRoleAssignment` object. Because you granted an *application* permission directly to a service principal, this **is** the admin consent - there is no separate "Grant admin consent" click for managed identities.
 
-**Verify**: the assignment should show up under **Entra ID → Enterprise applications → (the app) → Permissions**, listing `Sites.Selected` on `Microsoft Graph` as admin-consented. Or from PowerShell:
+**Verify**: the assignment should show up under **Entra ID → Enterprise applications → (the UAMI) → Permissions**, listing `Sites.Selected` on `Microsoft Graph` as admin-consented. Or from PowerShell:
 
 ```powershell
-Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $spObjectId |
+Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $uamiObjectId |
   Where-Object { $_.ResourceId -eq $graphSp.Id } |
   Select-Object PrincipalDisplayName, AppRoleId, ResourceDisplayName
 ```
 
 ##### Step 2 - Resolve the `siteId` of the target SharePoint site
 
-Every site-level grant needs the site's Graph id. Do this once per site (any Graph-permitted admin identity can call it - you're not using the app registration yet):
+Every site-level grant needs the site's Graph id. Do this once per site (any Graph-permitted admin identity can call it - you're not using the UAMI yet):
 
 ```powershell
 $sharePointHostname = "mycloudgurucom.sharepoint.com"
@@ -190,20 +193,20 @@ $siteId
 
 ```
 
-The pipeline script does the same lookup at runtime, so the app registration itself doesn't need this value stored anywhere - it's only used in step 3.
+The pipeline script does the same lookup at runtime, so the UAMI itself doesn't need this value stored anywhere - it's only used in step 3.
 
-##### Step 3 - Grant the app `read` + `write` on that one site
+##### Step 3 - Grant the UAMI `read` + `write` on that one site
 
-`POST /sites/{siteId}/permissions` gives the app registration's application the actual per-site access. Without this, `Sites.Selected` alone still returns `403` on every site.
+`POST /sites/{siteId}/permissions` gives the UAMI's application the actual per-site access. Without this, `Sites.Selected` alone still returns `403` on every site.
 
 ```powershell
-$appClientId = "183dd23f-XXXXX-YYYY"
-$appName      = "app-finops-tags"
+$uamiClientId = "183dd23f-XXXXX-YYYY"
+$uamiName     = "uami-finops"
 
 $body = @{
   roles               = @("read","write")
   grantedToIdentities = @(
-    @{ application = @{ id = $appClientId; displayName = $appName } }
+    @{ application = @{ id = $uamiClientId; displayName = $uamiName } }
   )
 } | ConvertTo-Json -Depth 5
 
@@ -223,11 +226,11 @@ Invoke-MgGraphRequest -Method DELETE `
 
 ##### Step 4 - Verify the pipeline can actually read the file
 
-The app has no secret to sign in with from your laptop, so the cleanest verification is to run the pipeline in dry-run mode (`whatIf = true`, the default). A successful run logs the CSV source URL and row count in its preamble - that proves the whole chain (tenant grant → site grant → file fetch) works. If Graph returns 401/403 there, jump to the [Common failure modes](#common-failure-modes) section for the fix path.
+Impersonation isn't possible for a managed identity from your laptop, so the cleanest verification is to run the pipeline in dry-run mode (`whatIf = true`, the default). A successful run logs the CSV source URL and row count in its preamble - that proves the whole chain (tenant grant → site grant → file fetch) works. If Graph returns 401/403 there, jump to the [Common failure modes](#common-failure-modes) section for the fix path.
 
-#### 3c. Microsoft Graph → Exchange Online (send the HTML report) - Tenant A only
+#### 3c. Microsoft Graph → Exchange Online (send the HTML report) - Tenant A UAMI only
 
-The app registration sends the report itself - there is no SMTP account, no app password, no shared secret. It calls `POST /v1.0/users/{mailFrom}/sendMail` with the same token type used for SharePoint, so the only new thing to grant is the **`Mail.Send` application permission**, plus a scoping policy so the app registration can send as *one* mailbox rather than the whole tenant.
+The UAMI sends the report itself - there is no SMTP account, no app password, no shared secret. It calls `POST /v1.0/users/{mailFrom}/sendMail` with the same token type used for SharePoint, so the only new thing to grant is the **`Mail.Send` application permission**, plus a scoping policy so the UAMI can send as *one* mailbox rather than the whole tenant.
 
 | What | Value |
 | --- | --- |
@@ -238,29 +241,29 @@ The app registration sends the report itself - there is no SMTP account, no app 
 
 > **Read this before granting.** `Mail.Send` as an *application* permission lets the identity send mail as **any mailbox in the tenant** by default. That is far wider than this pipeline needs. Step 2 below narrows it to the single `mailFrom` mailbox with an Exchange application access policy - treat that step as mandatory, not optional.
 
-##### Step 1 - Grant `Mail.Send` to the app registration
+##### Step 1 - Grant `Mail.Send` to the UAMI
 
-Same shape as the `Sites.Selected` grant in 3b; reuse the `$spObjectId` and `$graphSp` from that session.
+Same shape as the `Sites.Selected` grant in 3b; reuse the `$uamiObjectId` and `$graphSp` from that session.
 
 ```powershell
-$spObjectId   = "e1856993-XXXXX-ZZZZ"   # Tenant A service principal (Enterprise application) object id
+$uamiObjectId = "e1856993-XXXXX-ZZZZ"   # principalId of the managed identity
 $graphSp      = Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'"
 $mailSendRole = $graphSp.AppRoles | Where-Object { $_.Value -eq "Mail.Send" }
 
 New-MgServicePrincipalAppRoleAssignment `
-  -ServicePrincipalId $spObjectId `
-  -PrincipalId        $spObjectId `
+  -ServicePrincipalId $uamiObjectId `
+  -PrincipalId        $uamiObjectId `
   -ResourceId         $graphSp.Id `
   -AppRoleId          $mailSendRole.Id
 ```
 
-As with `Sites.Selected`, assigning an application permission directly to a service principal **is** the admin consent - there is no separate consent click needed.
+As with `Sites.Selected`, assigning an application permission directly to a service principal **is** the admin consent - there is no separate consent click for managed identities.
 
-**Verify**: **Entra ID → Enterprise applications → (the app) → Permissions** should now list both `Sites.Selected` and `Mail.Send` on Microsoft Graph.
+**Verify**: **Entra ID → Enterprise applications → (the UAMI) → Permissions** should now list both `Sites.Selected` and `Mail.Send` on Microsoft Graph.
 
 ##### Step 2 - Scope the grant to your existing sender mailbox
 
-Step 1 left the app registration able to send as **any** mailbox in the tenant. This step restricts it to the one existing mailbox you want the reports to come from - the value you put in the `mailFrom` pipeline variable.
+Step 1 left the UAMI able to send as **any** mailbox in the tenant. This step restricts it to the one existing mailbox you want the reports to come from - the value you put in the `mailFrom` pipeline variable.
 
 You do **not** need to create a distribution group or a mail-enabled security group for this. `-PolicyScopeGroupId` accepts any recipient, including a single user or shared mailbox, so point it straight at the mailbox you already have.
 
@@ -270,14 +273,14 @@ Requires the `ExchangeOnlineManagement` module and an Exchange admin:
 Install-Module ExchangeOnlineManagement -Scope CurrentUser
 Connect-ExchangeOnline
 
-# The app registration clientId, NOT the objectId used for role assignments.
-$appClientId = "183dd23f-XXXXX-YYYY"
+# The UAMI clientId, NOT the objectId used for role assignments.
+$uamiClientId = "183dd23f-XXXXX-YYYY"
 
 # The existing mailbox the reports send from - same value as the mailFrom variable.
 $senderMailbox = "admin@contoso.com"
 
 New-ApplicationAccessPolicy `
-  -AppId              $appClientId `
+  -AppId              $uamiClientId `
   -PolicyScopeGroupId $senderMailbox `
   -AccessRight        RestrictAccess `
   -Description        "Limit FinOps tag pipeline to the report sender mailbox"
@@ -285,7 +288,7 @@ New-ApplicationAccessPolicy `
 
 Two things to get right:
 
-- **`-AppId` is the app registration's clientId**, the same value used in the `POST /sites/{siteId}/permissions` body in 3b - not the principal/object id used for role assignments. This is the most common cause of a `403` on `sendMail`, because a policy built on the wrong id silently applies to nothing.
+- **`-AppId` is the UAMI's clientId**, the same value used in the `POST /sites/{siteId}/permissions` body in 3b - not the principal/object id used for role assignments. This is the most common cause of a `403` on `sendMail`, because a policy built on the wrong id silently applies to nothing.
 - **`-PolicyScopeGroupId` must be the mailbox itself**, and `mailFrom` must match it. The policy is an allow-list: anything not in scope is denied.
 
 If you later want reports to be sendable from more than one mailbox, that is when a mail-enabled security group is worth creating - put the mailboxes in it and pass the group here instead. For a single sender it adds an object to maintain and buys nothing.
@@ -293,10 +296,10 @@ If you later want reports to be sendable from more than one mailbox, that is whe
 Policies take up to ~30 minutes to propagate. Test once it is live:
 
 ```powershell
-Test-ApplicationAccessPolicy -Identity $senderMailbox -AppId $appClientId
+Test-ApplicationAccessPolicy -Identity $senderMailbox -AppId $uamiClientId
 # AccessCheckResult : Granted
 
-Test-ApplicationAccessPolicy -Identity "someone-else@contoso.com" -AppId $appClientId
+Test-ApplicationAccessPolicy -Identity "someone-else@contoso.com" -AppId $uamiClientId
 # AccessCheckResult : Denied   <- this result is what proves the scoping works
 ```
 
@@ -308,7 +311,7 @@ Mail is only sent on live runs, so queue the pipeline with `whatIf = false` (sco
 
 #### 3d. Azure DevOps
 
-The workload-identity service connection (`serviceConnectionName`) must be **authorized for the pipeline** (either at project level or via a pipeline-scoped grant). No further ADO role beyond that is required on the app registration.
+Both workload-identity service connections (`serviceConnectionName` and `tenantBServiceConnectionName`) must be **authorized for the pipeline** (either at project level or via a pipeline-scoped grant). No further ADO role beyond that is required on the app registration.
 
 ### 4. CSV shape
 
@@ -369,19 +372,20 @@ All values are HTML-encoded, so a stray `&` or `<` in a tag value cannot break t
 
 ### Common failure modes
 
-- **`Skipping tenant <id> - sign-in or subscription listing failed`** - the run carries on with the other tenants and counts this one in `tenantsFailed`. `AADSTS700016` / `AADSTS7000229` (application or service principal not found in the directory): the app has no service principal in that tenant - section 2 step 4. `403` on the `descendants` call: Reader is missing on that tenant's management group, or the management group name in `tenantScopes` is wrong.
-- **Run fails at `Signing in to tenant <home tenant> as app registration ...`** - the log prints the token's `iss` / `sub` / `aud` and the Entra error underneath. `AADSTS70021` / `AADSTS700213` (no matching federated identity record): the federated credential on the app registration doesn't match those three values - copy them from the UAMI's federated credential (section 2 step 3). `AADSTS700231`: the credential is the "Managed identity" kind pointing at the UAMI, which cannot work from a pipeline. `AADSTS700016`: `appClientId` is wrong. `Cannot sign in as the app registration: SYSTEM_OIDCREQUESTURI ...`: the task is missing `env: SYSTEM_ACCESSTOKEN: $(System.AccessToken)`.
+- **`Skipping tenant <id> - sign-in or subscription listing failed`** - the run carries on with the other tenants and counts this one in `tenantsFailed`. `403` on the `descendants` call: Reader is missing on that tenant's management group, or the management group name in `tenantScopes` is wrong.
+- **`Signing in to tenant <id> via service connection ...` fails** - the log prints the token's `iss` / `sub` / `aud` and the Entra error underneath. `AADSTS70021` / `AADSTS7002137` (no matching federated identity record): the federated credential on that tenant's UAMI doesn't match the service connection - the error text gives the subject it expects. An `Azure DevOps OIDC token error` line instead means Azure DevOps refused to issue a token for that connection to this task: check the pipeline is authorized to use the connection. `Cannot switch tenant: SYSTEM_OIDCREQUESTURI ...`: the task is missing `env: SYSTEM_ACCESSTOKEN: $(System.AccessToken)`.
+- **`Tenant B connection check` step fails** - the Tenant B service connection itself is broken (name wrong in `tenantBServiceConnectionName`, federated credential missing on the Tenant B UAMI, or the UAMI has no role on the scope the connection points at). Fix it in Azure DevOps before looking at the scripts.
 - **`Detected characters in arguments that may not be executed correctly by the shell`** - the `AzurePowerShell@5` task validates `scriptArguments` before the script starts and rejects `;` (and other shell metacharacters such as `&`, `|`, `<`, `>`). A pipeline variable passed as an argument contains one - usually `tenantScopes` or `mailTo` using `;` as the separator. Use `,` instead.
 - **`TenantScopes entry ... is not a tenant GUID`** - the `tenantScopes` variable still holds a placeholder or a tenant domain name. Use the tenant GUID.
 - **`CSV has rows for TenantId '...', which is not in TenantScopes`** - a CSV row names a tenant the pipeline isn't configured for (often a typo in the GUID). Fix the row or add the tenant to `tenantScopes`.
-- **`Set-AzContext failed` on a subscription** - the app registration likely lacks Reader on that subscription, or the subscription is disabled. Fix the role assignment; the script continues past the subscription and prints a warning.
+- **`Set-AzContext failed` on a subscription** - that tenant's UAMI likely lacks Reader on that subscription, or the subscription is disabled. Fix the role assignment; the script continues past the subscription and prints a warning.
 - **`CSV is missing required column`** - a header was renamed or removed. Fix the CSV; do not edit the script to accept the new name 
 - **`Verify failed for <RG>`** - the RG was written but the re-read did not observe the expected value. Usually caused by a concurrent tag write from another process. Re-run; if it persists, investigate the other writer.
-- **401/403 from Graph on the site fetch** - the app registration is missing `Sites.Selected` consent or does not have `read`/`write` on the specific site. Re-grant via `POST /sites/{siteId}/permissions`.
+- **401/403 from Graph on the site fetch** - the Tenant A UAMI is missing `Sites.Selected` consent or does not have `read`/`write` on the specific site. Re-grant via `POST /sites/{siteId}/permissions`.
 - **Duplicate `(TenantId, SubscriptionName, ResourceGroupName)` rows in CSV** - the last row wins (later rows overwrite earlier ones in `$index`). Deduplicate at the source.
 - **Subscription display name changed and CSV wasn't updated** - the subscription silently drops out of scope (logged as `skipped - SubscriptionName '...' not in CSV`). Rename the CSV row to match, or rename the subscription back.
 - **RG renamed and CSV wasn't updated** - the CSV still targets the old name, so both the old CSV row and the new RG go untouched. Fix the CSV to reference the current RG name.
-- **`403 ErrorAccessDenied` on `sendMail`** - the Exchange application access policy is blocking the sender. Confirm `New-ApplicationAccessPolicy` was created with the app registration's **clientId** (not its objectId) and that `-PolicyScopeGroupId` names the same mailbox as `mailFrom`: `Test-ApplicationAccessPolicy -Identity <mailFrom> -AppId <clientId>` must return `Granted`. Allow ~30 minutes after creating or editing a policy.
+- **`403 ErrorAccessDenied` on `sendMail`** - the Exchange application access policy is blocking the sender. Confirm `New-ApplicationAccessPolicy` was created with the Tenant A UAMI's **clientId** (not its objectId) and that `-PolicyScopeGroupId` names the same mailbox as `mailFrom`: `Test-ApplicationAccessPolicy -Identity <mailFrom> -AppId <clientId>` must return `Granted`. Allow ~30 minutes after creating or editing a policy.
 - **`404 (Not Found)` on `sendMail`** - about the **sender**, not the recipients and not the `Mail.Send` grant (a missing grant fails 403). `mailFrom` must resolve to a user object in this tenant - check the domain is one the tenant actually owns - and must have an Exchange Online mailbox; an unlicensed user, a distribution list and a mail-enabled security group all 404, a shared mailbox is fine. The log prints the Graph error alongside the failure; confirm with `Get-Mailbox <mailFrom>`.
 - **`401`/`403` immediately on `sendMail` but SharePoint worked** - `Mail.Send` was never granted, only `Sites.Selected`. Re-run step 1 of section 3c; the two grants are independent.
 - **Run succeeded but no email arrived** - check whether the log says `Email report skipped - no MailTo recipients configured`; that means the `mailTo` pipeline variable is empty or missing. Otherwise check the recipients' junk folders, since the sending mailbox is likely new.
