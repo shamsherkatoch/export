@@ -188,16 +188,27 @@ function Connect-Tenant {
             -FederatedToken $assertion -Scope Process -WarningAction SilentlyContinue
     } catch {
         # Connect-AzAccount reports any token failure as "Could not find tenant id for
-        # provided tenant domain", which hides the Entra error. Print the AADSTS error
-        # before rethrowing, or the failure is undiagnosable from the ADO log.
+        # provided tenant domain", which hides the Entra error. Replay the same exchange
+        # against the token endpoint so the AADSTS code lands in the log, then rethrow.
         Write-FederationDiagnostics -TenantId $TenantId -ClientId $conn.ClientId -Assertion $assertion
         throw
     }
 }
 
 function Write-FederationDiagnostics {
-    # Replays the sign-in against the Entra token endpoint purely to print its error body.
     param([string] $TenantId, [string] $ClientId, [string] $Assertion)
+    try {
+        # iss / sub / aud are what that tenant's UAMI federated credential must
+        # match. They identify the service connection and are not secret; the token itself is not printed.
+        $payload = ($Assertion -split '\.')[1].Replace('-', '+').Replace('_', '/')
+        while ($payload.Length % 4) { $payload += '=' }
+        $claims = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($payload)) | ConvertFrom-Json
+        foreach ($name in @('iss', 'sub', 'aud', 'idtyp', 'ver')) {
+            if ($claims.PSObject.Properties.Name -contains $name) { Write-Host "  assertion ${name}: $($claims.$name)" }
+        }
+    } catch {
+        Write-Host "  could not decode the assertion: $($_.Exception.Message)"
+    }
     try {
         $null = Invoke-RestMethod -Method POST -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" -Body @{
             grant_type            = 'client_credentials'
@@ -206,9 +217,12 @@ function Write-FederationDiagnostics {
             client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
             client_assertion      = $Assertion
         }
+        Write-Host "  token endpoint accepted the assertion - the failure is inside Connect-AzAccount, not Entra."
     } catch {
         if ($_.PSObject.Properties.Name -contains 'ErrorDetails' -and $_.ErrorDetails) {
             Write-Host "  Entra token error: $($_.ErrorDetails.Message)"
+        } else {
+            Write-Host "  Entra token request failed: $($_.Exception.Message)"
         }
     }
 }
