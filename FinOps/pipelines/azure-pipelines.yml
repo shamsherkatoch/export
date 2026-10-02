@@ -26,12 +26,14 @@ variables:
   sharePointHostname: "mycloudgurucom.sharepoint.com"
   sharePointSitePath: "/sites/mycloudguru"
   csvItemPath: "poc/tags.csv"
-  # Service connection backed by the UAMI in tenant B. Replace the placeholder.
-  tenantBServiceConnectionName: "sc-uami-poc-mcgau"
   # One "<tenantId>=<managementGroupName>" entry per tenant, separated by ','.
   # Not ';' - the AzurePowerShell task rejects ';' in scriptArguments ("Detected
   # characters in arguments that may not be executed correctly by the shell").
   tenantScopes: "c6029515-0784-4bf6-a47e-6ce74d8063b0=MCGAU,aa4a4b3b-6b92-4866-acdb-e65a044e4efa=CBRTC"
+  # How to sign in to each tenant other than tenant A:
+  # "<tenantId>=<client id of that tenant's UAMI>:<id of its service connection>".
+  # The connection id is the resourceId GUID in the service connection's URL.
+  tenantConnections: "aa4a4b3b-6b92-4866-acdb-e65a044e4efa=<tenantB-uami-client-id>:<tenantB-service-connection-id>"
   # Report email. mailTo accepts several addresses separated by ',' (not ';' - same task restriction).
   mailFrom: "admin@mycloudguru.com"
   mailTo: "shamsher.katoch@gmail.com"
@@ -47,26 +49,6 @@ jobs:
     steps:
       - checkout: self
 
-      # Signs in to tenant B on its own connection. This proves the connection works,
-      # makes the pipeline reference it (so it is authorized to request its OIDC token
-      # later), and publishes the three values the scripts need to sign in to tenant B
-      # themselves - so none of them has to be configured by hand.
-      - task: AzurePowerShell@5
-        displayName: Tenant B connection check
-        inputs:
-          azureSubscription: $(tenantBServiceConnectionName)
-          scriptType: InlineScript
-          Inline: |
-            $ctx = Get-AzContext
-            if (-not $ctx -or -not $env:AZURESUBSCRIPTION_SERVICE_CONNECTION_ID) { throw "Tenant B sign-in did not produce a context and a service connection id." }
-            Write-Host ("Tenant B: " + $ctx.Tenant.Id)
-            Write-Host ("##vso[task.setvariable variable=tenantBTenantId]" + $ctx.Tenant.Id)
-            Write-Host ("##vso[task.setvariable variable=tenantBClientId]" + $ctx.Account.Id)
-            Write-Host ("##vso[task.setvariable variable=tenantBConnectionId]" + $env:AZURESUBSCRIPTION_SERVICE_CONNECTION_ID)
-          azurePowerShellVersion: LatestVersion
-          pwsh: true
-          failOnStandardError: true
-
       - task: AzurePowerShell@5
         displayName: Sync-CsvWithAzure.ps1 (append missing RGs)
         inputs:
@@ -78,7 +60,7 @@ jobs:
             -SharePointSitePath "$(sharePointSitePath)"
             -CsvItemPath "$(csvItemPath)"
             -TenantScopes "$(tenantScopes)"
-            -TenantConnections "$(tenantBTenantId)=$(tenantBClientId):$(tenantBConnectionId)"
+            -TenantConnections "$(tenantConnections)"
             -WhatIfMode:$${{ parameters.whatIf }}
           azurePowerShellVersion: LatestVersion
           pwsh: true
@@ -98,7 +80,7 @@ jobs:
             -SharePointSitePath "$(sharePointSitePath)"
             -CsvItemPath "$(csvItemPath)"
             -TenantScopes "$(tenantScopes)"
-            -TenantConnections "$(tenantBTenantId)=$(tenantBClientId):$(tenantBConnectionId)"
+            -TenantConnections "$(tenantConnections)"
             -WhatIfMode:$${{ parameters.whatIf }}
             -MailFrom "$(mailFrom)"
             -MailTo "$(mailTo)"

@@ -205,27 +205,16 @@ function Connect-Tenant {
             -FederatedToken $assertion -Scope Process -WarningAction SilentlyContinue
     } catch {
         # Connect-AzAccount reports any token failure as "Could not find tenant id for
-        # provided tenant domain", which hides the Entra error. Replay the same exchange
-        # against the token endpoint so the AADSTS code lands in the log, then rethrow.
+        # provided tenant domain", which hides the Entra error. Print the AADSTS error
+        # before rethrowing, or the failure is undiagnosable from the ADO log.
         Write-FederationDiagnostics -TenantId $TenantId -ClientId $conn.ClientId -Assertion $assertion
         throw
     }
 }
 
 function Write-FederationDiagnostics {
+    # Replays the sign-in against the Entra token endpoint purely to print its error body.
     param([string] $TenantId, [string] $ClientId, [string] $Assertion)
-    try {
-        # iss / sub / aud are what that tenant's UAMI federated credential must
-        # match. They identify the service connection and are not secret; the token itself is not printed.
-        $payload = ($Assertion -split '\.')[1].Replace('-', '+').Replace('_', '/')
-        while ($payload.Length % 4) { $payload += '=' }
-        $claims = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($payload)) | ConvertFrom-Json
-        foreach ($name in @('iss', 'sub', 'aud', 'idtyp', 'ver')) {
-            if ($claims.PSObject.Properties.Name -contains $name) { Write-Host "  assertion ${name}: $($claims.$name)" }
-        }
-    } catch {
-        Write-Host "  could not decode the assertion: $($_.Exception.Message)"
-    }
     try {
         $null = Invoke-RestMethod -Method POST -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" -Body @{
             grant_type            = 'client_credentials'
@@ -234,12 +223,9 @@ function Write-FederationDiagnostics {
             client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
             client_assertion      = $Assertion
         }
-        Write-Host "  token endpoint accepted the assertion - the failure is inside Connect-AzAccount, not Entra."
     } catch {
         if ($_.PSObject.Properties.Name -contains 'ErrorDetails' -and $_.ErrorDetails) {
             Write-Host "  Entra token error: $($_.ErrorDetails.Message)"
-        } else {
-            Write-Host "  Entra token request failed: $($_.Exception.Message)"
         }
     }
 }
@@ -294,7 +280,7 @@ function Get-SubscriptionsUnderManagementGroup {
 }
 
 function New-CsvIndex {
-    param([object[]] $Rows)
+    param([object[]] $Rows, [Parameter(Mandatory)][string] $DefaultTenantId)
     if (-not $Rows -or $Rows.Count -eq 0) { throw "CSV is empty." }
 
     $required = @('TenantId', 'SubscriptionName', 'ResourceGroupName') + $script:ManagedKeys
@@ -306,14 +292,19 @@ function New-CsvIndex {
     # Nested index: $index[<tenantId>][<subName>][<rgName>] = @{ tagKey = normalizedValue }
     $index = @{}
     $skippedRows = 0
+    $defaultedRows = 0
     $rowNumber = 1   # header is row 1; data rows start at 2
     foreach ($row in $Rows) {
         $rowNumber++
         $tenantId = "$($row.TenantId)".Trim().ToLowerInvariant()
         $subName  = "$($row.SubscriptionName)".Trim().ToLowerInvariant()
         $rgName   = "$($row.ResourceGroupName)".Trim().ToLowerInvariant()
-        if (-not $tenantId -or -not $subName -or -not $rgName) {
-            Write-Warning "CSV row $rowNumber skipped - missing TenantId, SubscriptionName or ResourceGroupName (TenantId='$($row.TenantId)', SubscriptionName='$($row.SubscriptionName)', ResourceGroupName='$($row.ResourceGroupName)')."
+        # A blank TenantId means the home tenant. Rows written before the CSV had a
+        # TenantId column all belong there, and the sync task MUST apply the same
+        # rule or it appends a second, tenant-qualified row for every one of them.
+        if (-not $tenantId) { $tenantId = $DefaultTenantId; $defaultedRows++ }
+        if (-not $subName -or -not $rgName) {
+            Write-Warning "CSV row $rowNumber skipped - missing SubscriptionName or ResourceGroupName (SubscriptionName='$($row.SubscriptionName)', ResourceGroupName='$($row.ResourceGroupName)')."
             $skippedRows++
             continue
         }
@@ -326,10 +317,16 @@ function New-CsvIndex {
 
         if (-not $index.ContainsKey($tenantId)) { $index[$tenantId] = @{} }
         if (-not $index[$tenantId].ContainsKey($subName)) { $index[$tenantId][$subName] = @{} }
+        if ($index[$tenantId][$subName].ContainsKey($rgName)) {
+            Write-Warning "CSV row $rowNumber duplicates an earlier row for '$($row.SubscriptionName)' / '$($row.ResourceGroupName)' in tenant $tenantId - this later row wins."
+        }
         $index[$tenantId][$subName][$rgName] = $desired
     }
     if ($skippedRows -gt 0) {
-        Write-Host "New-CsvIndex: $skippedRows row(s) skipped due to missing TenantId, SubscriptionName or ResourceGroupName."
+        Write-Host "New-CsvIndex: $skippedRows row(s) skipped due to missing SubscriptionName or ResourceGroupName."
+    }
+    if ($defaultedRows -gt 0) {
+        Write-Host "New-CsvIndex: $defaultedRows row(s) have a blank TenantId and were treated as home tenant $DefaultTenantId."
     }
     return $index
 }
@@ -460,16 +457,25 @@ function New-ReconciliationHtmlReport {
         $html.Add('<p>No tag differences found - every matched resource group already agrees with the CSV.</p>')
     } else {
         $html.Add('<table style="border-collapse:collapse;">')
-        $html.Add("<tr><th $th>Tenant</th><th $th>Subscription</th><th $th>Resource group</th><th $th>Tag key</th><th $th>Current</th><th $th>CSV value</th></tr>")
+        # One row per resource group, one column per managed tag key. A changed key
+        # shows "current -> CSV value"; a key that already matched shows a dash.
+        $header = "<tr><th $th>Tenant</th><th $th>Subscription</th><th $th>Resource group</th>"
+        foreach ($key in $script:ManagedKeys) { $header += "<th $th>$(ConvertTo-HtmlText $key)<br>current &rarr; CSV value</th>" }
+        $html.Add($header + '</tr>')
         foreach ($result in $changed) {
-            foreach ($change in $result.Changes) {
-                $html.Add("<tr><td $td>$(ConvertTo-HtmlText $result.TenantId)</td>" +
-                          "<td $td>$(ConvertTo-HtmlText $result.SubscriptionName)</td>" +
-                          "<td $td>$(ConvertTo-HtmlText $result.ResourceGroupName)</td>" +
-                          "<td $td>$(ConvertTo-HtmlText $change.Key)</td>" +
-                          "<td $td>$(ConvertTo-HtmlText $change.From)</td>" +
-                          "<td $td>$(ConvertTo-HtmlText $change.To)</td></tr>")
+            $byKey = @{}
+            foreach ($change in $result.Changes) { $byKey[$change.Key] = $change }
+            $row = "<tr><td $td>$(ConvertTo-HtmlText $result.TenantId)</td>" +
+                   "<td $td>$(ConvertTo-HtmlText $result.SubscriptionName)</td>" +
+                   "<td $td>$(ConvertTo-HtmlText $result.ResourceGroupName)</td>"
+            foreach ($key in $script:ManagedKeys) {
+                if ($byKey.ContainsKey($key)) {
+                    $row += "<td $td>$(ConvertTo-HtmlText $byKey[$key].From) &rarr; <b>$(ConvertTo-HtmlText $byKey[$key].To)</b></td>"
+                } else {
+                    $row += "<td $td><span style=""color:#888;"">&ndash;</span></td>"
+                }
             }
+            $html.Add($row + '</tr>')
         }
         $html.Add('</table>')
     }
@@ -550,7 +556,7 @@ Write-Host "Reading CSV from SharePoint: $csvSource"
 $rows = Get-CsvFromSharePoint -Hostname $SharePointHostname -SitePath $SharePointSitePath -ItemPath $CsvItemPath
 Write-Host "CSV rows: $($rows.Count)"
 
-$csvIndex = New-CsvIndex -Rows $rows
+$csvIndex = New-CsvIndex -Rows $rows -DefaultTenantId $homeTenantId
 $totalSubs = 0
 $totalRules = 0
 foreach ($tenantRules in $csvIndex.Values) {

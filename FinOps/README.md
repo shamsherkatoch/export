@@ -12,7 +12,7 @@ Reconcile Azure resource-group tags against a SharePoint-hosted CSV that is the 
 - For each RG whose `(tenant, sub, rg)` triple is in the CSV, compares the four managed tag values (`BU`, `CO`, `GLC`, `FD`) after normalization (strip all whitespace, uppercase invariant) and merges only the keys whose current value differs from the CSV. Unmanaged tags on the RG are left untouched.
 - Re-reads the RG after writing and asserts the values took.
 - Prints a summary: `tenants inspected/skipped/failed`, `subs inspected/matched/skipped` and `rgs inspected/matched/updated/unchanged`.
-- On a successful run, renders an HTML report (run metadata, the summary counts, and a row per changed tag showing tenant, subscription, RG, key, current value, CSV value) and emails it through Microsoft Graph `sendMail` from a Tenant A mailbox.
+- On a successful run, renders an HTML report (run metadata, the summary counts, and a row per changed resource group with a column per tag showing current value → CSV value) and emails it through Microsoft Graph `sendMail` from a Tenant A mailbox.
 
 Tenants with no CSV rows are not signed in to by task 2. Subscriptions whose display name is not in the CSV for their tenant are skipped entirely - the script does not enter them or list their RGs. Inside a matched subscription, RGs whose name isn't in that subscription's CSV rows are left alone.
 
@@ -45,7 +45,7 @@ Define these directly on the pipeline (**Pipelines → select the pipeline → E
 | Variable | Example | Purpose |
 | --- | --- | --- |
 | `serviceConnectionName` | `sc-finops-tags` | ADO service connection (workload identity federation) backed by the UAMI in Tenant A. |
-| `tenantBServiceConnectionName` | `sc-finops-tags-tenantb` | ADO service connection (workload identity federation) backed by the UAMI in Tenant B. |
+| `tenantConnections` | `<tenantB-guid>=<uami-client-id>:<connection-id>` | For each tenant other than Tenant A: the client id of that tenant's UAMI and the id of its service connection (the `resourceId` GUID in the connection's URL). Entries separated by `,`. |
 | `sharePointHostname` | `contoso.sharepoint.com` | Host of the SharePoint tenant. |
 | `sharePointSitePath` | `/sites/finops` | Server-relative site path. |
 | `csvItemPath` | `Shared Documents/finops/tags.csv` | Drive-root-relative path to the CSV. |
@@ -67,12 +67,12 @@ Each tenant has its own identity and its own service connection. Nothing is shar
 | | Tenant A (home) | Tenant B |
 | --- | --- | --- |
 | Identity | UAMI in Tenant A | UAMI in Tenant B |
-| Service connection | `serviceConnectionName` | `tenantBServiceConnectionName` |
+| Service connection | `serviceConnectionName` | identified by id in `tenantConnections` |
 | Used for | Tenant A tags, SharePoint CSV, report mail | Tenant B tags only |
 
 For each tenant: create a User-Assigned Managed Identity in that tenant, then an Azure Resource Manager service connection using **workload identity federation** backed by it. For Tenant B, when the Azure DevOps organisation is connected to Tenant A, use the **manual** workload identity federation flow: enter Tenant B's tenant id and the UAMI's client id, then add the issuer and subject Azure DevOps shows as a federated credential on the Tenant B UAMI.
 
-The pipeline's first step (`Tenant B connection check`) signs in on the Tenant B connection and publishes its tenant id, client id and connection id as variables, which the two script tasks receive as `-TenantConnections`. Nothing about Tenant B other than the connection name is configured by hand.
+The Tenant B connection does not appear by name in the pipeline YAML: the scripts request its OIDC token by id. Put Tenant B's tenant id, the UAMI's client id and the connection id in `tenantConnections`, and authorize the pipeline on the connection (Service connection → Security → Pipeline permissions) - Azure DevOps will not prompt for it.
 
 ### 3. UAMI access
 
@@ -311,7 +311,7 @@ Mail is only sent on live runs, so queue the pipeline with `whatIf = false` (sco
 
 #### 3d. Azure DevOps
 
-Both workload-identity service connections (`serviceConnectionName` and `tenantBServiceConnectionName`) must be **authorized for the pipeline** (either at project level or via a pipeline-scoped grant). No further ADO role beyond that is required on the app registration.
+Both workload-identity service connections (`serviceConnectionName` and the Tenant B connection named by id in `tenantConnections`) must be **authorized for the pipeline** (either at project level or via a pipeline-scoped grant). No further ADO role beyond that is required on the app registration.
 
 ### 4. CSV shape
 
@@ -323,9 +323,9 @@ TenantId,SubscriptionName,ResourceGroupName,BusinessUnit,CostObject,GeneralLedge
 
 Match is by the triple `(TenantId, SubscriptionName, ResourceGroupName)`. `TenantId` is the Entra tenant GUID the subscription lives in. `SubscriptionName` is the subscription's **display name** as shown in the Azure portal / `descendants` API. Each CSV row applies to exactly one RG in exactly one subscription - no wildcards, no cross-subscription broadcasts.
 
-Rows with an empty `TenantId`, `SubscriptionName` or `ResourceGroupName` are skipped with a warning - a blank `TenantId` is **not** assumed to mean Tenant A. Rows whose `TenantId` isn't listed in `tenantScopes` are ignored with a warning. Missing required columns cause `New-CsvIndex` to throw and fail the run. Duplicate `(TenantId, SubscriptionName, ResourceGroupName)` rows silently let the later row win - deduplicate at the source. Extra columns (e.g. `SubscriptionId` kept for humans, `Owner`, `Notes`) are ignored.
+A blank `TenantId` means Tenant A (the home tenant), so rows that predate the column keep working. Rows with an empty `SubscriptionName` or `ResourceGroupName` are skipped with a warning. Rows whose `TenantId` isn't listed in `tenantScopes` are ignored with a warning. Missing required columns cause `New-CsvIndex` to throw and fail the run. Duplicate `(TenantId, SubscriptionName, ResourceGroupName)` rows let the later row win, with a warning in the log - deduplicate at the source. Extra columns (e.g. `SubscriptionId` kept for humans, `Owner`, `Notes`) are ignored.
 
-**Migrating an existing CSV**: add the `TenantId` column and fill it on **every** existing row before the first live run. Without the column both tasks fail with `CSV is missing required column: TenantId`. With the column present but a row left blank, that row is invisible to both tasks, and task 1 will append a second, tenant-qualified row for the same RG - the default dry run lists those as `+ will append` so you can catch it first.
+**Migrating an existing CSV**: add the `TenantId` column header. Existing rows can be left blank - they are treated as Tenant A - or filled with Tenant A's GUID. Without the column both tasks fail with `CSV is missing required column: TenantId`. Tenant B rows always carry Tenant B's GUID; the sync task fills it in when it appends them.
 
 ## Running the pipeline
 
@@ -360,7 +360,7 @@ Sent on every successful **live** run (`whatIf = false`). Dry runs, including th
 - **Header** - `LIVE - tags were merged` (green).
 - **Run metadata** - UTC timestamp, the tenant = management group list, CSV source URL.
 - **Summary** - the same ten counters printed in the log (tenants, subscriptions, resource groups).
-- **Changes table** - one row per changed tag key: tenant, subscription, resource group, tag key, current Azure value, CSV value. The heading reads `Changed (n resource group(s))`. Tags with no current value show `(not set)`. If nothing differs, the table is replaced with a single "No tag differences found" line.
+- **Changes table** - one row per changed resource group: tenant, subscription, resource group, then one column for each of the four tags showing `current → CSV value`. A tag that already matched shows a dash; a tag with no current value shows `(not set)`. The heading reads `Changed (n resource group(s))`. If nothing differs, the table is replaced with a single "No tag differences found" line.
 
 All values are HTML-encoded, so a stray `&` or `<` in a tag value cannot break the layout.
 
@@ -373,8 +373,8 @@ All values are HTML-encoded, so a stray `&` or `<` in a tag value cannot break t
 ### Common failure modes
 
 - **`Skipping tenant <id> - sign-in or subscription listing failed`** - the run carries on with the other tenants and counts this one in `tenantsFailed`. `403` on the `descendants` call: Reader is missing on that tenant's management group, or the management group name in `tenantScopes` is wrong.
-- **`Signing in to tenant <id> via service connection ...` fails** - the log prints the token's `iss` / `sub` / `aud` and the Entra error underneath. `AADSTS70021` / `AADSTS7002137` (no matching federated identity record): the federated credential on that tenant's UAMI doesn't match the service connection - the error text gives the subject it expects. An `Azure DevOps OIDC token error` line instead means Azure DevOps refused to issue a token for that connection to this task: check the pipeline is authorized to use the connection. `Cannot switch tenant: SYSTEM_OIDCREQUESTURI ...`: the task is missing `env: SYSTEM_ACCESSTOKEN: $(System.AccessToken)`.
-- **`Tenant B connection check` step fails** - the Tenant B service connection itself is broken (name wrong in `tenantBServiceConnectionName`, federated credential missing on the Tenant B UAMI, or the UAMI has no role on the scope the connection points at). Fix it in Azure DevOps before looking at the scripts.
+- **`Signing in to tenant <id> via service connection ...` fails** - the log prints the Entra error underneath. `AADSTS70021` / `AADSTS7002137` (no matching federated identity record): the federated credential on that tenant's UAMI doesn't match the service connection - the error text gives the subject it expects. An `Azure DevOps OIDC token error` line instead means Azure DevOps refused to issue a token for that connection to this task: check the pipeline is authorized to use the connection. `Cannot switch tenant: SYSTEM_OIDCREQUESTURI ...`: the task is missing `env: SYSTEM_ACCESSTOKEN: $(System.AccessToken)`.
+- **`TenantConnections entry ... is not in the form ...`** or **`... has no TenantConnections entry`** - the `tenantConnections` variable is missing Tenant B, or isn't `<tenantId>=<clientId>:<serviceConnectionId>`.
 - **`Detected characters in arguments that may not be executed correctly by the shell`** - the `AzurePowerShell@5` task validates `scriptArguments` before the script starts and rejects `;` (and other shell metacharacters such as `&`, `|`, `<`, `>`). A pipeline variable passed as an argument contains one - usually `tenantScopes` or `mailTo` using `;` as the separator. Use `,` instead.
 - **`TenantScopes entry ... is not a tenant GUID`** - the `tenantScopes` variable still holds a placeholder or a tenant domain name. Use the tenant GUID.
 - **`CSV has rows for TenantId '...', which is not in TenantScopes`** - a CSV row names a tenant the pipeline isn't configured for (often a typo in the GUID). Fix the row or add the tenant to `tenantScopes`.
