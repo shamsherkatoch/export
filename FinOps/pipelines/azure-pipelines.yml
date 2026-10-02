@@ -1,5 +1,8 @@
 # Reconcile Azure RG tags from a SharePoint CSV.
-# Auth: UAMI + workload-identity federated service connection (no secrets).
+# Auth (no secrets): the service connection signs in as a UAMI (workload identity
+# federation). The UAMI is a federated credential on a multi-tenant app registration
+# homed in tenant A; the scripts use it to sign that app registration in to each
+# tenant listed in tenantScopes. The app registration holds all the access.
 
 trigger: none
 pr: none
@@ -23,7 +26,12 @@ variables:
   sharePointHostname: "mycloudgurucom.sharepoint.com"
   sharePointSitePath: "/sites/mycloudguru"
   csvItemPath: "poc/tags.csv"
-  managementGroupId: "MCGAU"
+  # Application (client) id of the multi-tenant app registration. Replace the placeholder.
+  appClientId: "<app-registration-client-id>"
+  # One "<tenantId>=<managementGroupName>" entry per tenant, separated by ';'.
+  # Replace both placeholders with the real tenant GUIDs (and tenant B's MG) -
+  # the scripts refuse to run until each tenant id is a GUID.
+  tenantScopes: "<tenantA-id>=MCGAU;<tenantB-id>=<tenantB-managementGroup>"
   # Report email. mailTo accepts several addresses separated by ';' or ','.
   mailFrom: "admin@mycloudguru.com"
   mailTo: "shamsher.katoch@gmail.com"
@@ -49,7 +57,8 @@ jobs:
             -SharePointHostname "$(sharePointHostname)"
             -SharePointSitePath "$(sharePointSitePath)"
             -CsvItemPath "$(csvItemPath)"
-            -ManagementGroupId "$(managementGroupId)"
+            -TenantScopes "$(tenantScopes)"
+            -AppClientId "$(appClientId)"
             -WhatIfMode:$${{ parameters.whatIf }}
           azurePowerShellVersion: LatestVersion
           pwsh: true
@@ -65,7 +74,8 @@ jobs:
             -SharePointHostname "$(sharePointHostname)"
             -SharePointSitePath "$(sharePointSitePath)"
             -CsvItemPath "$(csvItemPath)"
-            -ManagementGroupId "$(managementGroupId)"
+            -TenantScopes "$(tenantScopes)"
+            -AppClientId "$(appClientId)"
             -WhatIfMode:$${{ parameters.whatIf }}
             -MailFrom "$(mailFrom)"
             -MailTo "$(mailTo)"

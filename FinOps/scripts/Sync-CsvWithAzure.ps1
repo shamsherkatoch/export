@@ -3,19 +3,22 @@
 
 <#
 .SYNOPSIS
-Ensure the tags CSV in SharePoint has a row for every (Subscription, ResourceGroup)
-pair currently present under a target management group. Existing rows are NEVER
+Ensure the tags CSV in SharePoint has a row for every (Tenant, Subscription,
+ResourceGroup) currently present under each configured tenant's management group -
+the same app registration is signed in to each tenant in turn. Existing rows are NEVER
 modified; missing pairs are appended, seeded with the RG's current tag values on
 the four managed keys (so humans see reality and can correct as needed).
 
 .DESCRIPTION
   - Read the CSV from SharePoint via Microsoft Graph and capture the drive item's ETag.
-  - Enumerate every subscription under -ManagementGroupId, then Set-AzContext +
-    Get-AzResourceGroup in each to build the actual (sub, RG) set. Unlike the
-    reconciliation task, this one has to look at every subscription - the whole
-    point is to discover ones not yet in the CSV.
-  - Compute the pairs that are in Azure but not the CSV.
-  - Append one row per missing pair, populating SubscriptionName, SubscriptionId
+  - For each tenant in -TenantScopes: sign the app registration (-AppClientId) in to
+    it with an assertion minted by the service connection's UAMI,
+    enumerate every subscription under its management group, then Set-AzContext +
+    Get-AzResourceGroup in each to build the actual (tenant, sub, RG) set. Unlike
+    the reconciliation task, this one has to look at every tenant and subscription -
+    the whole point is to discover ones not yet in the CSV.
+  - Compute the (tenant, sub, RG) entries that are in Azure but not the CSV.
+  - Append one row per missing entry, populating TenantId, SubscriptionName, SubscriptionId
     (if that column exists), ResourceGroupName, and - for each of the four managed
     tag keys - the RG's current tag value on that key (raw, as stored in Azure)
     or an empty cell if the RG has no such tag. Seeding from the RG rather than
@@ -41,8 +44,13 @@ Server-relative path to the site, e.g. "/sites/finops".
 .PARAMETER CsvItemPath
 Drive-root-relative path to the CSV, e.g. "Shared Documents/finops/tags.csv".
 
-.PARAMETER ManagementGroupId
-Management group name (not display name) whose subscription tree to scan.
+.PARAMETER TenantScopes
+The tenants to scan and the management group to scan in each, as
+"<tenantId>=<managementGroupName>" entries separated by ';' or ','. One entry per tenant.
+
+.PARAMETER AppClientId
+Application (client) id of the multi-tenant app registration that does the work.
+The service connection's UAMI must be a federated credential on it.
 
 .PARAMETER WhatIfMode
 When $true (default), log the rows that would be added but do not PUT the CSV back.
@@ -53,7 +61,8 @@ param(
     [Parameter(Mandatory)] [string] $SharePointHostname,
     [Parameter(Mandatory)] [string] $SharePointSitePath,
     [Parameter(Mandatory)] [string] $CsvItemPath,
-    [Parameter(Mandatory)] [string] $ManagementGroupId,
+    [Parameter(Mandatory)] [string] $TenantScopes,
+    [Parameter(Mandatory)] [string] $AppClientId,
     [Parameter()]          [bool]   $WhatIfMode = $true
 )
 
@@ -61,7 +70,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $script:ManagedKeys      = @('BusinessUnit', 'CostObject', 'GeneralLedgerCode', 'FinancialDelegate')
-$script:RequiredColumns  = @('SubscriptionName', 'ResourceGroupName') + $script:ManagedKeys
+$script:RequiredColumns  = @('TenantId', 'SubscriptionName', 'ResourceGroupName') + $script:ManagedKeys
 
 function Get-AccessTokenPlain {
     param([Parameter(Mandatory)][string] $ResourceUrl)
@@ -70,6 +79,60 @@ function Get-AccessTokenPlain {
         return [System.Net.NetworkCredential]::new('', $t.Token).Password
     }
     return $t.Token
+}
+
+function Resolve-TenantScopes {
+    # "tenantA-guid=mgA;tenantB-guid=mgB" -> one {TenantId, ManagementGroupId} per entry.
+    # The tenant list has to come from configuration, not the CSV: the sync task must
+    # discover RGs in a tenant that has no CSV rows yet, and the CSV holds no MG.
+    param([AllowNull()][string] $Value)
+    $out  = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+    foreach ($part in ("$Value" -split '[;,]')) {
+        $entry = $part.Trim()
+        if (-not $entry) { continue }
+        $pieces = @($entry -split '=', 2)
+        if ($pieces.Count -ne 2) {
+            throw "TenantScopes entry '$entry' is not in the form <tenantId>=<managementGroupId>."
+        }
+        $tenantId = $pieces[0].Trim().ToLowerInvariant()
+        $mgId     = $pieces[1].Trim()
+        if ($tenantId -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') {
+            throw "TenantScopes entry '$entry': '$tenantId' is not a tenant GUID."
+        }
+        if (-not $mgId) { throw "TenantScopes entry '$entry' has an empty management group id." }
+        # One MG per tenant. Two MGs in one tenant could overlap, and a subscription
+        # seen twice would be processed (and, in the sync task, appended) twice.
+        if ($seen.ContainsKey($tenantId)) { throw "TenantScopes lists tenant '$tenantId' more than once." }
+        $seen[$tenantId] = $true
+        $out.Add([pscustomobject]@{ TenantId = $tenantId; ManagementGroupId = $mgId })
+    }
+    return $out
+}
+
+function Get-BridgeAssertion {
+    # The service connection signs in as the UAMI; the app registration trusts that
+    # UAMI through a federated credential. A UAMI token for this fixed audience is
+    # the assertion that proves it, and it is accepted in every tenant the
+    # multi-tenant app has a service principal in. Only the UAMI can mint it, so the
+    # UAMI's context is made current first.
+    $null = Set-AzContext -Context $script:BridgeContext -WarningAction SilentlyContinue
+    return Get-AccessTokenPlain -ResourceUrl 'api://AzureADTokenExchange'
+}
+
+function Connect-Tenant {
+    # Make the app registration, signed in to $TenantId, the default Az context.
+    # No-op when it already is. The UAMI never does any of the work itself - it is
+    # only the bridge that gets the app registration signed in, with no secret.
+    param([Parameter(Mandatory)][string] $TenantId)
+    $ctx = Get-AzContext
+    if ($ctx -and $ctx.Tenant -and $ctx.Account -and
+        "$($ctx.Tenant.Id)" -eq $TenantId -and "$($ctx.Account.Id)" -eq $AppClientId) { return }
+
+    Write-Host "Signing in to tenant $TenantId as app registration $AppClientId (federated via the UAMI)"
+    $assertion = Get-BridgeAssertion
+    $null = Connect-AzAccount -ServicePrincipal -ApplicationId $AppClientId -Tenant $TenantId `
+        -FederatedToken $assertion -Scope Process -WarningAction SilentlyContinue
 }
 
 function Get-SharePointCsv {
@@ -145,22 +208,39 @@ function Get-SubscriptionsUnderManagementGroup {
 }
 
 function Get-ExistingPairSet {
-    # Nested hashtable: $set[<subName lower>][<rgName lower>] = $true.
-    # Rows with either match key blank cannot claim a pair unambiguously, so they
+    # Nested hashtable: $set[<tenantId lower>][<subName lower>][<rgName lower>] = $true.
+    # Rows with any match key blank cannot claim an RG unambiguously, so they
     # are ignored - the reconciliation task warns about them separately.
     param([object[]] $Rows)
     $set = @{}
     foreach ($row in $Rows) {
-        $subKey = "$($row.SubscriptionName)".Trim().ToLowerInvariant()
-        $rgKey  = "$($row.ResourceGroupName)".Trim().ToLowerInvariant()
-        if (-not $subKey -or -not $rgKey) { continue }
-        if (-not $set.ContainsKey($subKey)) { $set[$subKey] = @{} }
-        $set[$subKey][$rgKey] = $true
+        $tenantKey = "$($row.TenantId)".Trim().ToLowerInvariant()
+        $subKey    = "$($row.SubscriptionName)".Trim().ToLowerInvariant()
+        $rgKey     = "$($row.ResourceGroupName)".Trim().ToLowerInvariant()
+        if (-not $tenantKey -or -not $subKey -or -not $rgKey) { continue }
+        if (-not $set.ContainsKey($tenantKey)) { $set[$tenantKey] = @{} }
+        if (-not $set[$tenantKey].ContainsKey($subKey)) { $set[$tenantKey][$subKey] = @{} }
+        $set[$tenantKey][$subKey][$rgKey] = $true
     }
     return $set
 }
 
 # --- main --------------------------------------------------------------------
+
+# @() at the call site - the function's output unrolls.
+$scopes = @(Resolve-TenantScopes -Value $TenantScopes)
+if ($scopes.Count -eq 0) { throw "TenantScopes is empty. Expected '<tenantId>=<managementGroupId>[;...]'." }
+
+# The AzurePowerShell task signs in as the UAMI in the home tenant. The UAMI does none
+# of the work: its context is kept only to mint the assertion that signs the app
+# registration in. SharePoint lives in the home tenant, so the CSV GET and PUT
+# both run as the app registration signed in there.
+$script:BridgeContext = Get-AzContext
+if (-not $script:BridgeContext -or -not $script:BridgeContext.Tenant) { throw "No Az context - the script must run signed in to the home tenant." }
+$homeTenantId = "$($script:BridgeContext.Tenant.Id)".ToLowerInvariant()
+Write-Host "Home tenant: $homeTenantId (signed in as $($script:BridgeContext.Account.Id))"
+Write-Host "Tenant scopes: $(($scopes | ForEach-Object { "$($_.TenantId) = $($_.ManagementGroupId)" }) -join '; ')"
+Connect-Tenant -TenantId $homeTenantId
 
 Write-Host "Reading CSV from SharePoint: https://$SharePointHostname$SharePointSitePath/$CsvItemPath"
 $csv = Get-SharePointCsv -Hostname $SharePointHostname -SitePath $SharePointSitePath -ItemPath $CsvItemPath
@@ -178,84 +258,110 @@ foreach ($col in $script:RequiredColumns) {
 }
 
 $existing = Get-ExistingPairSet -Rows $csv.Rows
-$existingPairCount = ($existing.Values | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum
-Write-Host "CSV covers $($existing.Count) subscription(s), $existingPairCount (sub, RG) pair(s)."
-
-$subs = Get-SubscriptionsUnderManagementGroup -ManagementGroupId $ManagementGroupId
-Write-Host "Subscriptions under MG '$ManagementGroupId': $($subs.Count)"
+$existingSubCount = 0
+$existingRgCount  = 0
+foreach ($tenantSet in $existing.Values) {
+    $existingSubCount += $tenantSet.Count
+    foreach ($subSet in $tenantSet.Values) { $existingRgCount += $subSet.Count }
+}
+Write-Host "CSV covers $($existing.Count) tenant(s), $existingSubCount subscription(s), $existingRgCount (tenant, sub, RG) row(s)."
 
 $stats = [ordered]@{
-    subsInspected = 0
-    subsFailed    = 0
-    rgsInspected  = 0
-    rgsAlready    = 0
-    rgsToAppend   = 0
+    tenantsInspected = 0
+    tenantsFailed    = 0
+    subsInspected    = 0
+    subsFailed       = 0
+    rgsInspected     = 0
+    rgsAlready       = 0
+    rgsToAppend      = 0
 }
 
 $newRows = New-Object System.Collections.Generic.List[object]
 
-foreach ($sub in $subs) {
-    $stats.subsInspected++
+foreach ($scope in $scopes) {
+    $stats.tenantsInspected++
     Write-Host ""
-    Write-Host "=== Subscription: $($sub.Name) ($($sub.Id)) ==="
+    Write-Host "##### Tenant: $($scope.TenantId) (management group '$($scope.ManagementGroupId)') #####"
 
+    # A tenant that can't be signed in to or listed is skipped with a warning; its RGs
+    # simply aren't appended this run. One broken tenant must not block the others.
     try {
-        $null = Set-AzContext -SubscriptionId $sub.Id -WarningAction SilentlyContinue
+        Connect-Tenant -TenantId $scope.TenantId
+        $subs = @(Get-SubscriptionsUnderManagementGroup -ManagementGroupId $scope.ManagementGroupId)
     } catch {
-        Write-Warning "Skipping $($sub.Name) ($($sub.Id)) - Set-AzContext failed: $($_.Exception.Message)"
-        $stats.subsFailed++
+        Write-Warning "Skipping tenant $($scope.TenantId) - sign-in or subscription listing failed: $($_.Exception.Message)"
+        $stats.tenantsFailed++
         continue
     }
+    Write-Host "Subscriptions under MG '$($scope.ManagementGroupId)': $($subs.Count)"
 
-    $rgs = Get-AzResourceGroup
-    $subKey = "$($sub.Name)".Trim().ToLowerInvariant()
-    $existingForSub = if ($existing.ContainsKey($subKey)) { $existing[$subKey] } else { @{} }
+    $existingForTenant = if ($existing.ContainsKey($scope.TenantId)) { $existing[$scope.TenantId] } else { @{} }
 
-    foreach ($rg in $rgs) {
-        $stats.rgsInspected++
-        $rgKey = $rg.ResourceGroupName.ToLowerInvariant()
-        if ($existingForSub.ContainsKey($rgKey)) {
-            $stats.rgsAlready++
+    foreach ($sub in $subs) {
+        $stats.subsInspected++
+        Write-Host ""
+        Write-Host "=== Subscription: $($sub.Name) ($($sub.Id)) ==="
+
+        try {
+            $null = Set-AzContext -SubscriptionId $sub.Id -Tenant $scope.TenantId -WarningAction SilentlyContinue
+        } catch {
+            Write-Warning "Skipping $($sub.Name) ($($sub.Id)) - Set-AzContext failed: $($_.Exception.Message)"
+            $stats.subsFailed++
             continue
         }
-        $stats.rgsToAppend++
 
-        # Build the new row against the CSV's existing column order so ConvertTo-Csv
-        # writes a header identical to what was read. The four managed tag columns
-        # are seeded from the RG's current Azure tag value (raw, not normalized) so
-        # the CSV reflects the real starting state; unknown extra columns (Owner,
-        # Comments, etc.) round-trip as empty strings for the new row.
-        $rgTags = @{}
-        if ($rg.Tags) {
-            foreach ($e in $rg.Tags.GetEnumerator()) { $rgTags[$e.Key] = $e.Value }
-        }
+        $rgs = Get-AzResourceGroup
+        $subKey = "$($sub.Name)".Trim().ToLowerInvariant()
+        $existingForSub = if ($existingForTenant.ContainsKey($subKey)) { $existingForTenant[$subKey] } else { @{} }
 
-        $rowObj = [ordered]@{}
-        foreach ($col in $existingColumns) {
-            switch ($col) {
-                'SubscriptionName'  { $rowObj[$col] = $sub.Name }
-                'SubscriptionId'    { $rowObj[$col] = $sub.Id }
-                'ResourceGroupName' { $rowObj[$col] = $rg.ResourceGroupName }
-                default {
-                    if ($script:ManagedKeys -contains $col -and $rgTags.ContainsKey($col)) {
-                        $rowObj[$col] = $rgTags[$col]
-                    } else {
-                        $rowObj[$col] = ''
+        foreach ($rg in $rgs) {
+            $stats.rgsInspected++
+            $rgKey = $rg.ResourceGroupName.ToLowerInvariant()
+            if ($existingForSub.ContainsKey($rgKey)) {
+                $stats.rgsAlready++
+                continue
+            }
+            $stats.rgsToAppend++
+
+            # Build the new row against the CSV's existing column order so ConvertTo-Csv
+            # writes a header identical to what was read. The four managed tag columns
+            # are seeded from the RG's current Azure tag value (raw, not normalized) so
+            # the CSV reflects the real starting state; unknown extra columns (Owner,
+            # Comments, etc.) round-trip as empty strings for the new row.
+            $rgTags = @{}
+            if ($rg.Tags) {
+                foreach ($e in $rg.Tags.GetEnumerator()) { $rgTags[$e.Key] = $e.Value }
+            }
+
+            $rowObj = [ordered]@{}
+            foreach ($col in $existingColumns) {
+                switch ($col) {
+                    'TenantId'          { $rowObj[$col] = $scope.TenantId }
+                    'SubscriptionName'  { $rowObj[$col] = $sub.Name }
+                    'SubscriptionId'    { $rowObj[$col] = $sub.Id }
+                    'ResourceGroupName' { $rowObj[$col] = $rg.ResourceGroupName }
+                    default {
+                        if ($script:ManagedKeys -contains $col -and $rgTags.ContainsKey($col)) {
+                            $rowObj[$col] = $rgTags[$col]
+                        } else {
+                            $rowObj[$col] = ''
+                        }
                     }
                 }
             }
-        }
-        $newRows.Add([pscustomobject]$rowObj)
+            $newRows.Add([pscustomobject]$rowObj)
 
-        $seeded = @($script:ManagedKeys | Where-Object { $rgTags.ContainsKey($_) })
-        $seedNote = if ($seeded.Count -gt 0) { " (seeded: $($seeded -join ', '))" } else { '' }
-        Write-Host "  + will append: $($sub.Name) / $($rg.ResourceGroupName)$seedNote"
+            $seeded = @($script:ManagedKeys | Where-Object { $rgTags.ContainsKey($_) })
+            $seedNote = if ($seeded.Count -gt 0) { " (seeded: $($seeded -join ', '))" } else { '' }
+            Write-Host "  + will append: $($scope.TenantId) / $($sub.Name) / $($rg.ResourceGroupName)$seedNote"
+        }
     }
 }
 
 Write-Host ""
-Write-Host ("Summary: subs inspected={0}, failed={1} | rgs inspected={2}, already in CSV={3}, to append={4}" -f `
-    $stats.subsInspected, $stats.subsFailed, $stats.rgsInspected, $stats.rgsAlready, $stats.rgsToAppend)
+Write-Host ("Summary: tenants inspected={0}, failed={1} | subs inspected={2}, failed={3} | rgs inspected={4}, already in CSV={5}, to append={6}" -f `
+    $stats.tenantsInspected, $stats.tenantsFailed, $stats.subsInspected, $stats.subsFailed, `
+    $stats.rgsInspected, $stats.rgsAlready, $stats.rgsToAppend)
 
 if ($newRows.Count -eq 0) {
     Write-Host "No new rows - CSV is already in sync. Nothing to upload."
@@ -277,5 +383,7 @@ foreach ($r in $csv.Rows) { $combined.Add($r) }
 foreach ($r in $newRows)  { $combined.Add($r) }
 $csvText  = ($combined | ConvertTo-Csv -NoTypeInformation) -join "`r`n"
 
+# SharePoint is in the home tenant; the loop above may have left another tenant active.
+Connect-Tenant -TenantId $homeTenantId
 Set-SharePointCsv -SiteId $csv.SiteId -EncodedPath $csv.EncodedPath -ETag $csv.ETag -Content $csvText
 Write-Host "Uploaded updated CSV: +$($newRows.Count) row(s), total rows now $($combined.Count)."

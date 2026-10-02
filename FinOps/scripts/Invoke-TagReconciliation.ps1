@@ -7,10 +7,16 @@ Reconcile Azure resource-group tags against a CSV stored in SharePoint Online.
 
 .DESCRIPTION
 Summary:
-  - Read the CSV from SharePoint via Microsoft Graph, using the UAMI's OAuth token.
-  - Enumerate every subscription under -ManagementGroupId (returns both id and display name).
-  - Match by the pair (SubscriptionName, ResourceGroupName), both case-insensitive.
-    Subscriptions with no CSV rows are skipped entirely (no Set-AzContext, no RG listing).
+  - Read the CSV from SharePoint via Microsoft Graph, using the app registration's
+    OAuth token in its home tenant (the tenant the service connection signs in to).
+  - The service connection signs in as a UAMI, which is only a bridge: the UAMI is a
+    federated credential on the multi-tenant app registration (-AppClientId).
+  - For each tenant in -TenantScopes, sign that app registration in to the tenant
+    with an assertion minted by the UAMI, then enumerate every subscription
+    under that tenant's management group (returns both id and display name).
+  - Match by the triple (TenantId, SubscriptionName, ResourceGroupName), all case-insensitive.
+    Tenants with no CSV rows are not signed in to. Subscriptions with no CSV rows are
+    skipped entirely (no Set-AzContext, no RG listing).
     Inside a matched subscription, only RGs listed in that subscription's CSV rows are touched.
   - For each matched (subscription, RG), reconcile these tag keys against the CSV row:
     BusinessUnit, CostObject, GeneralLedgerCode, FinancialDelegate.
@@ -18,7 +24,7 @@ Summary:
   - Only keys whose current tag value differs from the CSV value are written.
   - Writes MERGE - tags outside the four managed keys are never touched.
   - After a successful live run, render an HTML report and mail it via Microsoft Graph
-    (POST /users/{MailFrom}/sendMail) using the same UAMI token. WhatIf runs send no mail.
+    (POST /users/{MailFrom}/sendMail) from the home tenant. WhatIf runs send no mail.
 
 .PARAMETER SharePointHostname
 Tenant hostname, e.g. "contoso.sharepoint.com".
@@ -29,8 +35,13 @@ Server-relative path to the site, e.g. "/sites/finops".
 .PARAMETER CsvItemPath
 Drive-root-relative path to the CSV, e.g. "Shared Documents/finops/tags.csv".
 
-.PARAMETER ManagementGroupId
-Management group name (not display name) whose subscription tree to reconcile.
+.PARAMETER TenantScopes
+The tenants to reconcile and the management group to scan in each, as
+"<tenantId>=<managementGroupName>" entries separated by ';' or ','. One entry per tenant.
+
+.PARAMETER AppClientId
+Application (client) id of the multi-tenant app registration that does the work.
+The service connection's UAMI must be a federated credential on it.
 
 .PARAMETER WhatIfMode
 When $true (default), log intended changes but do not write.
@@ -51,7 +62,8 @@ param(
     [Parameter(Mandatory)] [string] $SharePointHostname,
     [Parameter(Mandatory)] [string] $SharePointSitePath,
     [Parameter(Mandatory)] [string] $CsvItemPath,
-    [Parameter(Mandatory)] [string] $ManagementGroupId,
+    [Parameter(Mandatory)] [string] $TenantScopes,
+    [Parameter(Mandatory)] [string] $AppClientId,
     [Parameter()]          [bool]   $WhatIfMode = $true,
     [Parameter()]          [string] $MailFrom,
     [Parameter()]          [string[]] $MailTo = @(),
@@ -86,6 +98,60 @@ function Get-AccessTokenPlain {
         return [System.Net.NetworkCredential]::new('', $t.Token).Password
     }
     return $t.Token
+}
+
+function Resolve-TenantScopes {
+    # "tenantA-guid=mgA;tenantB-guid=mgB" -> one {TenantId, ManagementGroupId} per entry.
+    # The tenant list has to come from configuration, not the CSV: the sync task must
+    # discover RGs in a tenant that has no CSV rows yet, and the CSV holds no MG.
+    param([AllowNull()][string] $Value)
+    $out  = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+    foreach ($part in ("$Value" -split '[;,]')) {
+        $entry = $part.Trim()
+        if (-not $entry) { continue }
+        $pieces = @($entry -split '=', 2)
+        if ($pieces.Count -ne 2) {
+            throw "TenantScopes entry '$entry' is not in the form <tenantId>=<managementGroupId>."
+        }
+        $tenantId = $pieces[0].Trim().ToLowerInvariant()
+        $mgId     = $pieces[1].Trim()
+        if ($tenantId -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') {
+            throw "TenantScopes entry '$entry': '$tenantId' is not a tenant GUID."
+        }
+        if (-not $mgId) { throw "TenantScopes entry '$entry' has an empty management group id." }
+        # One MG per tenant. Two MGs in one tenant could overlap, and a subscription
+        # seen twice would be processed (and, in the sync task, appended) twice.
+        if ($seen.ContainsKey($tenantId)) { throw "TenantScopes lists tenant '$tenantId' more than once." }
+        $seen[$tenantId] = $true
+        $out.Add([pscustomobject]@{ TenantId = $tenantId; ManagementGroupId = $mgId })
+    }
+    return $out
+}
+
+function Get-BridgeAssertion {
+    # The service connection signs in as the UAMI; the app registration trusts that
+    # UAMI through a federated credential. A UAMI token for this fixed audience is
+    # the assertion that proves it, and it is accepted in every tenant the
+    # multi-tenant app has a service principal in. Only the UAMI can mint it, so the
+    # UAMI's context is made current first.
+    $null = Set-AzContext -Context $script:BridgeContext -WarningAction SilentlyContinue
+    return Get-AccessTokenPlain -ResourceUrl 'api://AzureADTokenExchange'
+}
+
+function Connect-Tenant {
+    # Make the app registration, signed in to $TenantId, the default Az context.
+    # No-op when it already is. The UAMI never does any of the work itself - it is
+    # only the bridge that gets the app registration signed in, with no secret.
+    param([Parameter(Mandatory)][string] $TenantId)
+    $ctx = Get-AzContext
+    if ($ctx -and $ctx.Tenant -and $ctx.Account -and
+        "$($ctx.Tenant.Id)" -eq $TenantId -and "$($ctx.Account.Id)" -eq $AppClientId) { return }
+
+    Write-Host "Signing in to tenant $TenantId as app registration $AppClientId (federated via the UAMI)"
+    $assertion = Get-BridgeAssertion
+    $null = Connect-AzAccount -ServicePrincipal -ApplicationId $AppClientId -Tenant $TenantId `
+        -FederatedToken $assertion -Scope Process -WarningAction SilentlyContinue
 }
 
 function Invoke-GraphGet {
@@ -141,22 +207,23 @@ function New-CsvIndex {
     param([object[]] $Rows)
     if (-not $Rows -or $Rows.Count -eq 0) { throw "CSV is empty." }
 
-    $required = @('SubscriptionName', 'ResourceGroupName') + $script:ManagedKeys
+    $required = @('TenantId', 'SubscriptionName', 'ResourceGroupName') + $script:ManagedKeys
     $present = $Rows[0].PSObject.Properties.Name
     foreach ($col in $required) {
         if ($present -notcontains $col) { throw "CSV is missing required column: $col" }
     }
 
-    # Nested index: $index[<subName>][<rgName>] = @{ tagKey = normalizedValue }
+    # Nested index: $index[<tenantId>][<subName>][<rgName>] = @{ tagKey = normalizedValue }
     $index = @{}
     $skippedRows = 0
     $rowNumber = 1   # header is row 1; data rows start at 2
     foreach ($row in $Rows) {
         $rowNumber++
-        $subName = "$($row.SubscriptionName)".Trim().ToLowerInvariant()
-        $rgName  = "$($row.ResourceGroupName)".Trim().ToLowerInvariant()
-        if (-not $subName -or -not $rgName) {
-            Write-Warning "CSV row $rowNumber skipped - missing SubscriptionName or ResourceGroupName (SubscriptionName='$($row.SubscriptionName)', ResourceGroupName='$($row.ResourceGroupName)')."
+        $tenantId = "$($row.TenantId)".Trim().ToLowerInvariant()
+        $subName  = "$($row.SubscriptionName)".Trim().ToLowerInvariant()
+        $rgName   = "$($row.ResourceGroupName)".Trim().ToLowerInvariant()
+        if (-not $tenantId -or -not $subName -or -not $rgName) {
+            Write-Warning "CSV row $rowNumber skipped - missing TenantId, SubscriptionName or ResourceGroupName (TenantId='$($row.TenantId)', SubscriptionName='$($row.SubscriptionName)', ResourceGroupName='$($row.ResourceGroupName)')."
             $skippedRows++
             continue
         }
@@ -167,11 +234,12 @@ function New-CsvIndex {
             if ($null -ne $normalized) { $desired[$k] = $normalized }
         }
 
-        if (-not $index.ContainsKey($subName)) { $index[$subName] = @{} }
-        $index[$subName][$rgName] = $desired
+        if (-not $index.ContainsKey($tenantId)) { $index[$tenantId] = @{} }
+        if (-not $index[$tenantId].ContainsKey($subName)) { $index[$tenantId][$subName] = @{} }
+        $index[$tenantId][$subName][$rgName] = $desired
     }
     if ($skippedRows -gt 0) {
-        Write-Host "New-CsvIndex: $skippedRows row(s) skipped due to missing SubscriptionName or ResourceGroupName."
+        Write-Host "New-CsvIndex: $skippedRows row(s) skipped due to missing TenantId, SubscriptionName or ResourceGroupName."
     }
     return $index
 }
@@ -262,7 +330,7 @@ function New-ReconciliationHtmlReport {
     param(
         [Parameter(Mandatory)] $Stats,
         [Parameter()][AllowEmptyCollection()][object[]] $Results = @(),
-        [Parameter(Mandatory)][string] $ManagementGroupId,
+        [Parameter(Mandatory)][string] $TenantScopes,
         [Parameter(Mandatory)][string] $CsvSource
     )
 
@@ -283,7 +351,7 @@ function New-ReconciliationHtmlReport {
 
     $html.Add('<table style="border-collapse:collapse;margin-bottom:20px;">')
     $html.Add("<tr><td $td>Run (UTC)</td><td $td>$runTime</td></tr>")
-    $html.Add("<tr><td $td>Management group</td><td $td>$(ConvertTo-HtmlText $ManagementGroupId)</td></tr>")
+    $html.Add("<tr><td $td>Tenant = management group</td><td $td>$(ConvertTo-HtmlText $TenantScopes)</td></tr>")
     $html.Add("<tr><td $td>CSV source</td><td $td>$(ConvertTo-HtmlText $CsvSource)</td></tr>")
     $html.Add('</table>')
 
@@ -302,10 +370,11 @@ function New-ReconciliationHtmlReport {
         $html.Add('<p>No tag differences found - every matched resource group already agrees with the CSV.</p>')
     } else {
         $html.Add('<table style="border-collapse:collapse;">')
-        $html.Add("<tr><th $th>Subscription</th><th $th>Resource group</th><th $th>Tag key</th><th $th>Current</th><th $th>CSV value</th></tr>")
+        $html.Add("<tr><th $th>Tenant</th><th $th>Subscription</th><th $th>Resource group</th><th $th>Tag key</th><th $th>Current</th><th $th>CSV value</th></tr>")
         foreach ($result in $changed) {
             foreach ($change in $result.Changes) {
-                $html.Add("<tr><td $td>$(ConvertTo-HtmlText $result.SubscriptionName)</td>" +
+                $html.Add("<tr><td $td>$(ConvertTo-HtmlText $result.TenantId)</td>" +
+                          "<td $td>$(ConvertTo-HtmlText $result.SubscriptionName)</td>" +
                           "<td $td>$(ConvertTo-HtmlText $result.ResourceGroupName)</td>" +
                           "<td $td>$(ConvertTo-HtmlText $change.Key)</td>" +
                           "<td $td>$(ConvertTo-HtmlText $change.From)</td>" +
@@ -361,75 +430,133 @@ function Send-GraphMailReport {
 
 # --- main --------------------------------------------------------------------
 
+# @() at the call site - the function's output unrolls (see Resolve-MailRecipients below).
+$scopes = @(Resolve-TenantScopes -Value $TenantScopes)
+if ($scopes.Count -eq 0) { throw "TenantScopes is empty. Expected '<tenantId>=<managementGroupId>[;...]'." }
+$scopeLabel = ($scopes | ForEach-Object { "$($_.TenantId) = $($_.ManagementGroupId)" }) -join '; '
+
+# The AzurePowerShell task signs in as the UAMI in the home tenant. The UAMI does none
+# of the work: its context is kept only to mint the assertion that signs the app
+# registration in. SharePoint and the report mailbox live in the home tenant, so
+# every Graph call runs as the app registration signed in there.
+$script:BridgeContext = Get-AzContext
+if (-not $script:BridgeContext -or -not $script:BridgeContext.Tenant) { throw "No Az context - the script must run signed in to the home tenant." }
+$homeTenantId = "$($script:BridgeContext.Tenant.Id)".ToLowerInvariant()
+Write-Host "Home tenant: $homeTenantId (signed in as $($script:BridgeContext.Account.Id))"
+Write-Host "Tenant scopes: $scopeLabel"
+Connect-Tenant -TenantId $homeTenantId
+
 $csvSource = "https://$SharePointHostname$SharePointSitePath/$CsvItemPath"
 Write-Host "Reading CSV from SharePoint: $csvSource"
 $rows = Get-CsvFromSharePoint -Hostname $SharePointHostname -SitePath $SharePointSitePath -ItemPath $CsvItemPath
 Write-Host "CSV rows: $($rows.Count)"
 
 $csvIndex = New-CsvIndex -Rows $rows
-$totalRules = ($csvIndex.Values | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum
-Write-Host "CSV subscriptions: $($csvIndex.Count); total (sub, RG) rules: $totalRules"
+$totalSubs = 0
+$totalRules = 0
+foreach ($tenantRules in $csvIndex.Values) {
+    $totalSubs += $tenantRules.Count
+    foreach ($subRules in $tenantRules.Values) { $totalRules += $subRules.Count }
+}
+Write-Host "CSV tenants: $($csvIndex.Count); subscriptions: $totalSubs; total (tenant, sub, RG) rules: $totalRules"
 
-$subs = Get-SubscriptionsUnderManagementGroup -ManagementGroupId $ManagementGroupId
-Write-Host "Subscriptions under MG '$ManagementGroupId': $($subs.Count)"
+# Rows for a tenant that isn't configured can never be applied - say so rather than
+# leaving them to drop out silently.
+$scopedTenantIds = @($scopes | ForEach-Object { $_.TenantId })
+foreach ($csvTenantId in $csvIndex.Keys) {
+    if ($scopedTenantIds -notcontains $csvTenantId) {
+        Write-Warning "CSV has rows for TenantId '$csvTenantId', which is not in TenantScopes - those rows are ignored."
+    }
+}
 
 $stats = [ordered]@{
-    subsInspected = 0
-    subsMatched   = 0
-    subsSkipped   = 0
-    rgsInspected  = 0
-    rgsMatched    = 0
-    rgsUpdated    = 0
-    rgsUnchanged  = 0
+    tenantsInspected = 0
+    tenantsSkipped   = 0
+    tenantsFailed    = 0
+    subsInspected    = 0
+    subsMatched      = 0
+    subsSkipped      = 0
+    rgsInspected     = 0
+    rgsMatched       = 0
+    rgsUpdated       = 0
+    rgsUnchanged     = 0
 }
 
 $results = New-Object System.Collections.Generic.List[object]
 
-foreach ($sub in $subs) {
-    $stats.subsInspected++
+foreach ($scope in $scopes) {
+    $stats.tenantsInspected++
     Write-Host ""
-    Write-Host "=== Subscription: $($sub.Name) ($($sub.Id)) ==="
+    Write-Host "##### Tenant: $($scope.TenantId) (management group '$($scope.ManagementGroupId)') #####"
 
-    $subKey = "$($sub.Name)".Trim().ToLowerInvariant()
-    if (-not $csvIndex.ContainsKey($subKey)) {
-        Write-Host "  skipped - SubscriptionName '$($sub.Name)' not in CSV"
-        $stats.subsSkipped++
+    if (-not $csvIndex.ContainsKey($scope.TenantId)) {
+        Write-Host "  skipped - TenantId '$($scope.TenantId)' not in CSV"
+        $stats.tenantsSkipped++
         continue
     }
-    $stats.subsMatched++
-    $rgRules = $csvIndex[$subKey]
+    $tenantRules = $csvIndex[$scope.TenantId]
 
+    # A tenant that can't be signed in to or listed (app not consented there, no Reader
+    # on the MG) is skipped with a warning, the same way an unreachable subscription
+    # is - one broken tenant must not block the others.
     try {
-        $null = Set-AzContext -SubscriptionId $sub.Id -WarningAction SilentlyContinue
+        Connect-Tenant -TenantId $scope.TenantId
+        $subs = @(Get-SubscriptionsUnderManagementGroup -ManagementGroupId $scope.ManagementGroupId)
     } catch {
-        Write-Warning "Skipping $($sub.Name) ($($sub.Id)) - Set-AzContext failed: $($_.Exception.Message)"
+        Write-Warning "Skipping tenant $($scope.TenantId) - sign-in or subscription listing failed: $($_.Exception.Message)"
+        $stats.tenantsFailed++
         continue
     }
+    Write-Host "Subscriptions under MG '$($scope.ManagementGroupId)': $($subs.Count)"
 
-    $rgs = Get-AzResourceGroup
-    foreach ($rg in $rgs) {
-        $stats.rgsInspected++
-        $rgKey = $rg.ResourceGroupName.ToLowerInvariant()
-        if (-not $rgRules.ContainsKey($rgKey)) { continue }
-        $stats.rgsMatched++
+    foreach ($sub in $subs) {
+        $stats.subsInspected++
+        Write-Host ""
+        Write-Host "=== Subscription: $($sub.Name) ($($sub.Id)) ==="
 
-        $desired = $rgRules[$rgKey]
+        $subKey = "$($sub.Name)".Trim().ToLowerInvariant()
+        if (-not $tenantRules.ContainsKey($subKey)) {
+            Write-Host "  skipped - SubscriptionName '$($sub.Name)' not in CSV for this tenant"
+            $stats.subsSkipped++
+            continue
+        }
+        $stats.subsMatched++
+        $rgRules = $tenantRules[$subKey]
 
-        $sync = Sync-ResourceGroupTags -ResourceGroup $rg -Desired $desired -WhatIfMode:$WhatIfMode
+        try {
+            $null = Set-AzContext -SubscriptionId $sub.Id -Tenant $scope.TenantId -WarningAction SilentlyContinue
+        } catch {
+            Write-Warning "Skipping $($sub.Name) ($($sub.Id)) - Set-AzContext failed: $($_.Exception.Message)"
+            continue
+        }
 
-        $results.Add([pscustomobject]@{
-            SubscriptionName  = $sub.Name
-            ResourceGroupName = $rg.ResourceGroupName
-            Changes           = $sync.Changes
-        })
+        $rgs = Get-AzResourceGroup
+        foreach ($rg in $rgs) {
+            $stats.rgsInspected++
+            $rgKey = $rg.ResourceGroupName.ToLowerInvariant()
+            if (-not $rgRules.ContainsKey($rgKey)) { continue }
+            $stats.rgsMatched++
 
-        if ($sync.Changes.Count -gt 0) { $stats.rgsUpdated++ } else { $stats.rgsUnchanged++ }
+            $desired = $rgRules[$rgKey]
+
+            $sync = Sync-ResourceGroupTags -ResourceGroup $rg -Desired $desired -WhatIfMode:$WhatIfMode
+
+            $results.Add([pscustomobject]@{
+                TenantId          = $scope.TenantId
+                SubscriptionName  = $sub.Name
+                ResourceGroupName = $rg.ResourceGroupName
+                Changes           = $sync.Changes
+            })
+
+            if ($sync.Changes.Count -gt 0) { $stats.rgsUpdated++ } else { $stats.rgsUnchanged++ }
+        }
     }
 }
 
 Write-Host ""
 Write-Host "Done. WhatIfMode=$WhatIfMode"
-Write-Host ("Summary: subs inspected={0}, matched={1}, skipped={2} | rgs inspected={3}, matched={4}, updated={5}, unchanged={6}" -f `
+Write-Host ("Summary: tenants inspected={0}, skipped={1}, failed={2} | subs inspected={3}, matched={4}, skipped={5} | rgs inspected={6}, matched={7}, updated={8}, unchanged={9}" -f `
+    $stats.tenantsInspected, $stats.tenantsSkipped, $stats.tenantsFailed, `
     $stats.subsInspected, $stats.subsMatched, $stats.subsSkipped, `
     $stats.rgsInspected, $stats.rgsMatched, $stats.rgsUpdated, $stats.rgsUnchanged)
 
@@ -460,13 +587,15 @@ if ([string]::IsNullOrWhiteSpace($MailFrom)) {
 $html = New-ReconciliationHtmlReport `
     -Stats $stats `
     -Results $results `
-    -ManagementGroupId $ManagementGroupId `
+    -TenantScopes $scopeLabel `
     -CsvSource $csvSource
 
 # "LIVE" stays in the subject so existing inbox rules keyed on it keep matching.
 $subject = "{0} - LIVE - {1} RG(s) changed" -f $MailSubject, $stats.rgsUpdated
 
 Write-Host ""
+# The mailbox is in the home tenant; the loop above may have left another tenant active.
+Connect-Tenant -TenantId $homeTenantId
 Write-Host "Sending report to $($recipients.Count) recipient(s): $($recipients -join ', ')"
 Send-GraphMailReport -From $MailFrom -To $recipients -Subject $subject -HtmlBody $html
 Write-Host "Report sent."
